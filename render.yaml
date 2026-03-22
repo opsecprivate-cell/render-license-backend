@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: render-license-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: render-license-db
+          property: connectionString
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_APPLICATION_ID
+        sync: false
+      - key: DISCORD_ALLOWED_USER_IDS
+        sync: false
+      - key: SCRIPT_SOURCE_PATH
+        value: ./private-script.js
+      - key: SESSION_TIMEOUT_MS
+        value: "86400000"
+      - key: ADMIN_KICK_LOCK_MS
+        value: "300000"
+      - key: CHAT_MAX_MESSAGES
+        value: "150"
+      - key: CHAT_RETENTION_MS
+        value: "86400000"
+      - key: REQUEST_MAX_SKEW_MS
+        value: "300000"
+      - key: REQUEST_NONCE_TTL_MS
+        value: "120000"
+      - key: DISCORD_AUTO_MESSAGE_CHANNEL_ID
+        value: "1482826609575854140"
+      - key: DISCORD_AUTO_MESSAGE_MODE
+        value: "stats"
+      - key: DISCORD_AUTO_MESSAGE_TEXT
+        value: "render is best in"
+      - key: DISCORD_AUTO_MESSAGE_INTERVAL_MS
+        value: "600000"
+      - key: DISCORD_RECONNECT_DELAY_MS
+        value: "30000"
+      - key: SERVICE_SSH_ENABLED
+        value: "true"
+      - key: SERVICE_SSH_HOST
+        value: satanc2.top
+      - key: SERVICE_SSH_PORT
+        value: "2115"
+      - key: SERVICE_SSH_USERNAME
+        sync: false
+      - key: SERVICE_SSH_PASSWORD
+        sync: false
+      - key: SERVICE_SSH_PRIVATE_KEY_B64
+        sync: false
+      - key: SERVICE_SSH_PASSPHRASE
+        sync: false
+      - key: SERVICE_SSH_COMMAND_TIMEOUT_MS
+        value: "20000"
+      - key: SERVICE_SSH_COMMANDS
+        sync: false
+      - key: SELF_PING_ENABLED
+        value: "true"
+      - key: SELF_PING_INTERVAL_MS
+        value: "300000"
+databases:
+  - name: render-license-db
+    plan: free
+    databaseName: render_license
+    user: render_license

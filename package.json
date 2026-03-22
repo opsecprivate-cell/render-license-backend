@@ -1,0 +1,19 @@
+{
+  "name": "render-license-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "discord.js": "^14.19.3",
+    "express": "^4.21.2",
+    "pg": "^8.13.3",
+    "ssh2": "^1.15.0"
+  }
+}
