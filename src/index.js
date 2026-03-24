@@ -19,12 +19,7 @@ const { ensureSchema } = require("./schema");
 
 const app = express();
 
-const DEFAULT_DISCORD_ALLOWED_USER_IDS = [
-  "945370152298504304",
-  "1364273789487157412",
-  "521796074365648916",
-  "1457825249474252991"
-];
+const DEFAULT_DISCORD_ALLOWED_USER_IDS = [];
 const DEFAULT_DISCORD_AUTO_MESSAGE_CHANNEL_ID = "1482826609575854140";
 const DEFAULT_DISCORD_AUTO_MESSAGE_MODE = "stats";
 const DEFAULT_DISCORD_AUTO_MESSAGE_TEXT = "render is best in";
@@ -1263,16 +1258,25 @@ function toPositiveInt(value, fallback) {
 
 function parseDiscordIdAllowlist(rawValue, fallbackIds = []) {
   const raw = String(rawValue || "").trim();
-  const entries = raw ? raw.split(",") : fallbackIds;
+  const entries = raw ? raw.split(/[,\s]+/) : fallbackIds;
   const ids = entries
     .map((entry) => String(entry || "").trim())
     .filter((entry) => /^\d{10,22}$/.test(entry));
   return new Set(ids);
 }
 
-function isDiscordUserAllowed(userId) {
-  const normalized = String(userId || "").trim();
-  return Boolean(normalized) && CONFIG.discordAllowedUserIds.has(normalized);
+function isDiscordUserAllowed(interaction) {
+  const normalized = String(interaction?.user?.id || "").trim();
+  if (!normalized) {
+    return false;
+  }
+  if (CONFIG.discordAllowedUserIds.size > 0) {
+    return CONFIG.discordAllowedUserIds.has(normalized);
+  }
+  if (!interaction?.inGuild?.()) {
+    return false;
+  }
+  return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) === true;
 }
 
 function normalizeSshPrivateKey(rawValue) {
@@ -1562,10 +1566,14 @@ async function startDiscordBot() {
     const rest = new REST({ version: "10" }).setToken(CONFIG.discordBotToken);
     await rest.put(
       Routes.applicationCommands(CONFIG.discordApplicationId),
-      { body: commands.map((command) => command.toJSON()) }
+      { body: commands.map((command) => ({ ...command.toJSON(), dm_permission: false })) }
     );
     console.log(`Registered ${commands.length} Discord slash commands`);
-    console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
+    if (CONFIG.discordAllowedUserIds.size > 0) {
+      console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
+    } else {
+      console.log("Discord slash command allowlist disabled; guild administrators are allowed.");
+    }
 
     const client = new Client({ intents: [GatewayIntentBits.Guilds] });
     discordClient = client;
@@ -1735,9 +1743,12 @@ async function startDiscordAutoMessageLoop(client) {
 
 async function handleDiscordInteraction(interaction) {
   try {
-    if (!isDiscordUserAllowed(interaction.user?.id)) {
+    if (!isDiscordUserAllowed(interaction)) {
+      const reason = CONFIG.discordAllowedUserIds.size > 0
+        ? "You are not on DISCORD_ALLOWED_USER_IDS."
+        : "You must be a server administrator to use Render auth commands.";
       await interaction.reply({
-        embeds: [errorEmbed("Access Denied", "You are not allowed to use Render auth commands.")],
+        embeds: [errorEmbed("Access Denied", reason)],
         ephemeral: true
       });
       return;
@@ -1787,7 +1798,7 @@ async function handleDiscordInteraction(interaction) {
         response = await discordCmdService(interaction);
         break;
       default:
-        response = errorEmbed("Unknown Command", "This slash command is not implemented.");
+        response = { embeds: [errorEmbed("Unknown Command", "This slash command is not implemented.")] };
         break;
     }
     await interaction.editReply(response);
