@@ -19,12 +19,7 @@ const { ensureSchema } = require("./schema");
 
 const app = express();
 
-const DEFAULT_DISCORD_ALLOWED_USER_IDS = [
-  "945370152298504304",
-  "1364273789487157412",
-  "521796074365648916",
-  "1457825249474252991"
-];
+const DEFAULT_DISCORD_ALLOWED_USER_IDS = [];
 const DEFAULT_DISCORD_AUTO_MESSAGE_CHANNEL_ID = "1482826609575854140";
 const DEFAULT_DISCORD_AUTO_MESSAGE_MODE = "stats";
 const DEFAULT_DISCORD_AUTO_MESSAGE_TEXT = "render is best in";
@@ -128,9 +123,6 @@ app.post("/upload-script", (_req, res) => {
 app.post("/presence", asyncHandler(handlePresence));
 app.post("/chat/send", asyncHandler(handleChatSend));
 app.post("/chat/fetch", asyncHandler(handleChatFetch));
-app.post("/call/send", asyncHandler(handleCallSend));
-app.post("/call/fetch", asyncHandler(handleCallFetch));
-app.post("/typing/set", asyncHandler(handleTypingSet));
 app.post("/admin/users", asyncHandler(handleAdminUsers));
 app.post("/admin/kick", asyncHandler(handleAdminKick));
 app.post("/admin/freeze", asyncHandler(handleAdminFreeze));
@@ -502,66 +494,6 @@ async function handlePresence(req, res) {
   });
 }
 
-function parseRenderChatEnvelopeMeta(message) {
-  const raw = String(message || "");
-  if (!raw.startsWith("::r2::")) {
-    return { kind: "text", signalType: "" };
-  }
-  try {
-    const data = JSON.parse(raw.slice(6));
-    return {
-      kind: typeof data?.kind === "string" ? data.kind : "text",
-      signalType: typeof data?.signalType === "string" ? data.signalType : ""
-    };
-  } catch {
-    return { kind: "text", signalType: "" };
-  }
-}
-
-function normalizeChatIdentity(value, maxLength = 28) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-async function getRealtimeScope(sessionToken, body) {
-  const myPresence = await queryOne(
-    "SELECT username, server, server_id FROM presence WHERE session_id = $1",
-    [sessionToken]
-  );
-  const targetServerId = normalizeServerId(body?.serverId) || normalizeServerId(myPresence?.server_id);
-  const targetServerName = normalizeServerLabel(body?.server || myPresence?.server);
-  return {
-    username: normalizeChatIdentity(myPresence?.username, 28),
-    serverId: targetServerId || "",
-    serverName: targetServerName || "",
-    presence: myPresence || null
-  };
-}
-
-function matchesRealtimeScope(scope, serverId, serverName) {
-  const normalizedServerId = normalizeServerId(serverId);
-  const normalizedServerName = normalizeServerLabel(serverName);
-  if (scope.serverId) {
-    return normalizedServerId === scope.serverId;
-  }
-  if (scope.serverName) {
-    return normalizedServerName === scope.serverName;
-  }
-  return true;
-}
-
-function isCrossScopeRealtimeSignal(signalType) {
-  const normalized = normalizeChatIdentity(signalType, 24).toLowerCase();
-  return normalized.startsWith("screen");
-}
-
-async function cleanupRealtimeRows(now = Date.now()) {
-  await query("DELETE FROM call_signal_queue WHERE created_at < $1", [now - 120000]);
-  await query("DELETE FROM typing_state WHERE last_seen < $1", [now - 10000]);
-}
-
 async function handleChatSend(req, res) {
   const body = req.body || {};
   const sessionToken = String(body.sessionToken || "").trim();
@@ -582,29 +514,19 @@ async function handleChatSend(req, res) {
     "SELECT username, server FROM presence WHERE session_id = $1",
     [sessionToken]
   );
-  const bodyUsername = normalizeChatIdentity(body.username, 28);
-  const bodyServer = normalizeServerLabel(body.server);
-  const senderName = bodyUsername || normalizeChatIdentity(presence?.username, 28) || "Unknown";
-  const senderServer = bodyServer || normalizeServerLabel(presence?.server) || "Unknown";
-  const envelopeMeta = parseRenderChatEnvelopeMeta(message);
-  const isRealtimeSignal = envelopeMeta.kind === "signal";
+  const fallbackUsername = String(body.username || "Unknown").trim() || "Unknown";
+  const fallbackServer = String(body.server || "Unknown").trim() || "Unknown";
+  const senderName = String(presence?.username || fallbackUsername).trim() || "Unknown";
+  const senderServer = String(presence?.server || fallbackServer).trim() || "Unknown";
 
   const now = Date.now();
   const recent = await queryOne(
-    "SELECT timestamp, message FROM chat WHERE sender_key = $1 ORDER BY timestamp DESC LIMIT 1",
+    "SELECT timestamp FROM chat WHERE sender_key = $1 ORDER BY timestamp DESC LIMIT 1",
     [session.session.key_id]
   );
-  if (recent) {
-    const recentAt = Number(recent.timestamp || 0);
-    const recentMessage = String(recent.message || "");
-    if (recentMessage === message && now - recentAt < (isRealtimeSignal ? 1500 : 2500)) {
-      res.json({ success: true, deduped: true });
-      return;
-    }
-    if (!isRealtimeSignal && now - recentAt < 600) {
-      res.status(429).json({ error: "Rate limited" });
-      return;
-    }
+  if (recent && now - Number(recent.timestamp) < 2000) {
+    res.status(429).json({ error: "Rate limited" });
+    return;
   }
 
   await query(
@@ -660,20 +582,7 @@ async function handleChatFetch(req, res) {
   } : null;
 
   const messagesResult = await query(
-    `
-      SELECT
-        chat.sender_key,
-        chat.sender_name,
-        chat.server,
-        chat.message,
-        chat.timestamp,
-        COALESCE(keys.is_admin, FALSE) AS sender_is_admin
-      FROM chat
-      LEFT JOIN keys ON keys.key_id = chat.sender_key
-      WHERE chat.timestamp > $1
-      ORDER BY chat.timestamp ASC
-      LIMIT 50
-    `,
+    "SELECT sender_name, server, message, timestamp FROM chat WHERE timestamp > $1 ORDER BY timestamp ASC LIMIT 50",
     [since]
   );
   const usersResult = await query(
@@ -687,168 +596,25 @@ async function handleChatFetch(req, res) {
   );
 
   const users = usersResult.rows;
-  const serverUsers = usersResult.rows;
-  const messages = messagesResult.rows;
+  const serverUsers = serverScope
+    ? users.filter((user) => {
+      const sameServerId = serverScope.serverId && normalizeServerId(user.server_id) === serverScope.serverId;
+      const sameServerName = serverScope.serverName && normalizeServerLabel(user.server) === serverScope.serverName;
+      return sameServerId || sameServerName;
+    })
+    : users;
+  const messages = serverScope && serverScope.serverName
+    ? messagesResult.rows.filter((message) => {
+      const sameServerName = serverScope.serverName && normalizeServerLabel(message.server) === serverScope.serverName;
+      return sameServerName;
+    })
+    : messagesResult.rows;
 
   res.json({
     messages,
-    users,
-    serverUsers,
-    globalChat: true
+    users: serverScope ? serverUsers : users,
+    serverUsers
   });
-}
-
-async function handleCallSend(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/call/send", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const signalType = normalizeChatIdentity(body.signalType, 24).toLowerCase();
-  const allowedSignalTypes = new Set(["offer", "answer", "ice", "hangup", "decline", "busy", "adminok", "adminno", "screenoffer", "screenanswer", "screenice", "screenhangup", "screendecline", "screenbusy"]);
-  const targetUser = normalizeChatIdentity(body.targetUser, 28);
-  const payload = typeof body.payload === "string" ? body.payload : JSON.stringify(body.payload || {});
-  if (!targetUser || !allowedSignalTypes.has(signalType) || !payload || payload.length > 40000) {
-    res.status(400).json({ error: "Invalid call signal" });
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const senderName = normalizeChatIdentity(body.username, 28) || scope.username || "Unknown";
-  const senderServer = String(scope.presence?.server || body.server || "Unknown").trim() || "Unknown";
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-  await query(
-    `
-      INSERT INTO call_signal_queue (sender_key, sender_name, target_user, server, server_id, signal_type, payload, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `,
-    [session.session.key_id, senderName, targetUser, senderServer, scope.serverId || "", signalType, payload, now]
-  );
-  res.json({ success: true });
-}
-
-async function handleCallFetch(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/call/fetch", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const requestedUsername = normalizeChatIdentity(body.username, 28) || scope.username;
-  const sinceId = Math.max(0, Number(body.lastSignalId || 0));
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-
-  const rawSignals = await query(
-    `
-      SELECT id, sender_name, target_user, server, server_id, signal_type, payload, created_at
-      FROM call_signal_queue
-      WHERE id > $1 AND target_user = $2
-      ORDER BY id ASC
-      LIMIT 200
-    `,
-    [sinceId, requestedUsername]
-  );
-  const signals = rawSignals.rows
-    .filter((row) => isCrossScopeRealtimeSignal(row.signal_type) || matchesRealtimeScope(scope, row.server_id, row.server))
-    .map((row) => ({
-      id: Number(row.id || 0),
-      senderName: normalizeChatIdentity(row.sender_name, 28),
-      targetUser: normalizeChatIdentity(row.target_user, 28),
-      signalType: normalizeChatIdentity(row.signal_type, 24).toLowerCase(),
-      payload: String(row.payload || ""),
-      createdAt: Number(row.created_at || 0)
-    }));
-
-  const typingRows = await query(
-    `
-      SELECT sender_name, target_user, server, server_id, last_seen
-      FROM typing_state
-      WHERE last_seen > $1
-      ORDER BY last_seen DESC
-    `,
-    [now - 3500]
-  );
-  const typingUsers = [];
-  const typingSeen = new Set();
-  for (const row of typingRows.rows) {
-    if (!matchesRealtimeScope(scope, row.server_id, row.server)) {
-      continue;
-    }
-    const senderName = normalizeChatIdentity(row.sender_name, 28);
-    const targetUser = normalizeChatIdentity(row.target_user, 28);
-    if (!senderName || senderName === requestedUsername) {
-      continue;
-    }
-    const direct = !!targetUser;
-    if (direct && targetUser !== requestedUsername) {
-      continue;
-    }
-    const key = `${senderName}|${direct ? "direct" : "public"}`;
-    if (typingSeen.has(key)) {
-      continue;
-    }
-    typingSeen.add(key);
-    typingUsers.push({
-      user: senderName,
-      direct,
-      targetUser,
-      lastSeen: Number(row.last_seen || 0)
-    });
-  }
-
-  res.json({ signals, typingUsers });
-}
-
-async function handleTypingSet(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/typing/set", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const senderName = normalizeChatIdentity(body.username, 28) || scope.username || "Unknown";
-  const senderServer = String(scope.presence?.server || body.server || "Unknown").trim() || "Unknown";
-  const targetUser = normalizeChatIdentity(body.targetUser, 28);
-  const active = Boolean(body.active);
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-  if (!active) {
-    await query(
-      `
-        DELETE FROM typing_state
-        WHERE sender_key = $1 AND target_user = $2 AND server = $3 AND server_id = $4
-      `,
-      [session.session.key_id, targetUser, senderServer, scope.serverId || ""]
-    );
-    res.json({ success: true });
-    return;
-  }
-
-  await query(
-    `
-      INSERT INTO typing_state (sender_key, sender_name, target_user, server, server_id, last_seen)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (sender_key, target_user, server, server_id) DO UPDATE SET
-        sender_name = EXCLUDED.sender_name,
-        last_seen = EXCLUDED.last_seen
-    `,
-    [session.session.key_id, senderName, targetUser, senderServer, scope.serverId || "", now]
-  );
-  res.json({ success: true });
 }
 
 async function handleAdminUsers(req, res) {
@@ -1011,41 +777,36 @@ async function getSessionForEndpoint(req, sessionToken, hwid, endpoint, body) {
 }
 
 async function getScriptSource(req) {
-  try {
-    const stat = await fs.stat(CONFIG.scriptSourcePath);
-    if (stat.mtimeMs !== scriptCache.mtimeMs) {
-      scriptCache = {
-        mtimeMs: stat.mtimeMs,
-        content: await fs.readFile(CONFIG.scriptSourcePath, "utf8")
-      };
+  if (CONFIG.scriptSourceUrl) {
+    const headers = {};
+    if (CONFIG.scriptSourceUserAgent) {
+      headers["User-Agent"] = CONFIG.scriptSourceUserAgent;
     }
-    return rewriteScriptServerUrl(scriptCache.content, req);
-  } catch (localError) {
-    if (!CONFIG.scriptSourceUrl) {
-      throw localError;
+    if (CONFIG.scriptSourceAccept) {
+      headers.Accept = CONFIG.scriptSourceAccept;
     }
-    console.warn(`Local script source unavailable, falling back to SCRIPT_SOURCE_URL: ${localError.message}`);
+    if (CONFIG.scriptSourceAuthToken) {
+      const authValue = CONFIG.scriptSourceAuthScheme
+        ? `${CONFIG.scriptSourceAuthScheme} ${CONFIG.scriptSourceAuthToken}`
+        : CONFIG.scriptSourceAuthToken;
+      headers[CONFIG.scriptSourceAuthHeader || "Authorization"] = authValue;
+    }
+
+    const response = await fetch(CONFIG.scriptSourceUrl, { headers });
+    if (!response.ok) {
+      throw new Error(`SCRIPT_SOURCE_URL fetch failed with ${response.status}`);
+    }
+    return rewriteScriptServerUrl(await response.text(), req);
   }
 
-  const headers = {};
-  if (CONFIG.scriptSourceUserAgent) {
-    headers["User-Agent"] = CONFIG.scriptSourceUserAgent;
+  const stat = await fs.stat(CONFIG.scriptSourcePath);
+  if (stat.mtimeMs !== scriptCache.mtimeMs) {
+    scriptCache = {
+      mtimeMs: stat.mtimeMs,
+      content: await fs.readFile(CONFIG.scriptSourcePath, "utf8")
+    };
   }
-  if (CONFIG.scriptSourceAccept) {
-    headers.Accept = CONFIG.scriptSourceAccept;
-  }
-  if (CONFIG.scriptSourceAuthToken) {
-    const authValue = CONFIG.scriptSourceAuthScheme
-      ? `${CONFIG.scriptSourceAuthScheme} ${CONFIG.scriptSourceAuthToken}`
-      : CONFIG.scriptSourceAuthToken;
-    headers[CONFIG.scriptSourceAuthHeader || "Authorization"] = authValue;
-  }
-
-  const response = await fetch(CONFIG.scriptSourceUrl, { headers });
-  if (!response.ok) {
-    throw new Error(`SCRIPT_SOURCE_URL fetch failed with ${response.status}`);
-  }
-  return rewriteScriptServerUrl(await response.text(), req);
+  return rewriteScriptServerUrl(scriptCache.content, req);
 }
 
 function rewriteScriptServerUrl(source, req) {
@@ -1263,16 +1024,25 @@ function toPositiveInt(value, fallback) {
 
 function parseDiscordIdAllowlist(rawValue, fallbackIds = []) {
   const raw = String(rawValue || "").trim();
-  const entries = raw ? raw.split(",") : fallbackIds;
+  const entries = raw ? raw.split(/[,\s]+/) : fallbackIds;
   const ids = entries
     .map((entry) => String(entry || "").trim())
     .filter((entry) => /^\d{10,22}$/.test(entry));
   return new Set(ids);
 }
 
-function isDiscordUserAllowed(userId) {
-  const normalized = String(userId || "").trim();
-  return Boolean(normalized) && CONFIG.discordAllowedUserIds.has(normalized);
+function isDiscordUserAllowed(interaction) {
+  const normalized = String(interaction?.user?.id || "").trim();
+  if (!normalized) {
+    return false;
+  }
+  if (CONFIG.discordAllowedUserIds.size > 0) {
+    return CONFIG.discordAllowedUserIds.has(normalized);
+  }
+  if (!interaction?.inGuild?.()) {
+    return false;
+  }
+  return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) === true;
 }
 
 function normalizeSshPrivateKey(rawValue) {
@@ -1562,10 +1332,14 @@ async function startDiscordBot() {
     const rest = new REST({ version: "10" }).setToken(CONFIG.discordBotToken);
     await rest.put(
       Routes.applicationCommands(CONFIG.discordApplicationId),
-      { body: commands.map((command) => command.toJSON()) }
+      { body: commands.map((command) => ({ ...command.toJSON(), dm_permission: false })) }
     );
     console.log(`Registered ${commands.length} Discord slash commands`);
-    console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
+    if (CONFIG.discordAllowedUserIds.size > 0) {
+      console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
+    } else {
+      console.log("Discord slash command allowlist disabled; guild administrators are allowed.");
+    }
 
     const client = new Client({ intents: [GatewayIntentBits.Guilds] });
     discordClient = client;
@@ -1735,9 +1509,12 @@ async function startDiscordAutoMessageLoop(client) {
 
 async function handleDiscordInteraction(interaction) {
   try {
-    if (!isDiscordUserAllowed(interaction.user?.id)) {
+    if (!isDiscordUserAllowed(interaction)) {
+      const reason = CONFIG.discordAllowedUserIds.size > 0
+        ? "You are not on DISCORD_ALLOWED_USER_IDS."
+        : "You must be a server administrator to use Render auth commands.";
       await interaction.reply({
-        embeds: [errorEmbed("Access Denied", "You are not allowed to use Render auth commands.")],
+        embeds: [errorEmbed("Access Denied", reason)],
         ephemeral: true
       });
       return;
@@ -1787,7 +1564,7 @@ async function handleDiscordInteraction(interaction) {
         response = await discordCmdService(interaction);
         break;
       default:
-        response = errorEmbed("Unknown Command", "This slash command is not implemented.");
+        response = { embeds: [errorEmbed("Unknown Command", "This slash command is not implemented.")] };
         break;
     }
     await interaction.editReply(response);

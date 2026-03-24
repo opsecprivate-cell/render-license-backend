@@ -104,46 +104,6 @@ const statements = [
     ON chat(server, timestamp DESC)
   `,
   `
-    CREATE TABLE IF NOT EXISTS call_signal_queue (
-      id BIGSERIAL PRIMARY KEY,
-      sender_key TEXT NOT NULL REFERENCES keys(key_id) ON DELETE CASCADE,
-      sender_name TEXT NOT NULL,
-      target_user TEXT NOT NULL,
-      server TEXT NOT NULL,
-      server_id TEXT NOT NULL DEFAULT '',
-      signal_type TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      created_at BIGINT NOT NULL
-    )
-  `,
-  `
-    CREATE INDEX IF NOT EXISTS idx_call_signal_target_created
-    ON call_signal_queue(target_user, created_at)
-  `,
-  `
-    CREATE INDEX IF NOT EXISTS idx_call_signal_server_created
-    ON call_signal_queue(server_id, server, created_at)
-  `,
-  `
-    CREATE TABLE IF NOT EXISTS typing_state (
-      sender_key TEXT NOT NULL REFERENCES keys(key_id) ON DELETE CASCADE,
-      sender_name TEXT NOT NULL,
-      target_user TEXT NOT NULL DEFAULT '',
-      server TEXT NOT NULL,
-      server_id TEXT NOT NULL DEFAULT '',
-      last_seen BIGINT NOT NULL,
-      PRIMARY KEY (sender_key, target_user, server, server_id)
-    )
-  `,
-  `
-    CREATE INDEX IF NOT EXISTS idx_typing_state_target_last_seen
-    ON typing_state(target_user, last_seen)
-  `,
-  `
-    CREATE INDEX IF NOT EXISTS idx_typing_state_server_last_seen
-    ON typing_state(server_id, server, last_seen)
-  `,
-  `
     CREATE TABLE IF NOT EXISTS key_activations (
       key_id TEXT NOT NULL REFERENCES keys(key_id) ON DELETE CASCADE,
       hwid TEXT NOT NULL,
