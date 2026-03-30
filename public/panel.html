@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Render Control Panel</title>
+  <link rel="stylesheet" href="/panel/assets/panel.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Render Admin</p>
+        <h1>Control Panel</h1>
+        <p class="hero-copy">Generate keys, manage live users, and run service actions without Discord.</p>
+      </div>
+      <div class="hero-meta">
+        <span id="session-label" class="session-label">Not signed in</span>
+        <button id="logout-button" class="ghost-button hidden" type="button">Logout</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section id="login-card" class="card login-card">
+        <div class="card-header">
+          <h2>Admin Login</h2>
+          <p>Use an admin key to unlock the panel.</p>
+        </div>
+        <form id="login-form" class="stack">
+          <label class="field">
+            <span>Admin key</span>
+            <input id="admin-key-input" name="adminKey" autocomplete="off" placeholder="ADMIN-XXXX-XXXX-XXXX" required>
+          </label>
+          <button class="primary-button" type="submit">Enter Panel</button>
+        </form>
+      </section>
+
+      <div id="app-shell" class="app-shell hidden">
+        <section class="stats-grid" id="stats-grid"></section>
+
+        <section class="panel-grid">
+          <section class="card">
+            <div class="card-header">
+              <h2>Generate Keys</h2>
+              <p>Create normal or admin licenses from the browser.</p>
+            </div>
+            <form id="generate-form" class="stack">
+              <div class="form-row">
+                <label class="field">
+                  <span>Amount</span>
+                  <input id="generate-amount" type="number" min="1" max="50" value="1">
+                </label>
+                <label class="field">
+                  <span>Duration</span>
+                  <input id="generate-duration" placeholder="lifetime, 7d, 12h" value="lifetime">
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="field checkbox-field">
+                  <input id="generate-shared" type="checkbox">
+                  <span>Shared key</span>
+                </label>
+                <label class="field checkbox-field">
+                  <input id="generate-admin" type="checkbox">
+                  <span>Admin key</span>
+                </label>
+                <label class="field">
+                  <span>Max uses</span>
+                  <input id="generate-max-uses" type="number" min="0" max="100000" value="0">
+                </label>
+              </div>
+              <button class="primary-button" type="submit">Generate</button>
+            </form>
+            <pre id="generate-output" class="output-box empty">No keys generated yet.</pre>
+          </section>
+
+          <section class="card">
+            <div class="card-header">
+              <h2>Key Actions</h2>
+              <p>Search a key, inspect it, and run the same actions you had on Discord.</p>
+            </div>
+            <form id="key-info-form" class="stack">
+              <div class="form-row">
+                <label class="field grow">
+                  <span>Key</span>
+                  <input id="key-input" placeholder="MOPE-XXXX-XXXX-XXXXXX or ADMIN-XXXX-XXXX-XXXX" required>
+                </label>
+                <button class="primary-button compact" type="submit">Load</button>
+              </div>
+            </form>
+            <div class="action-grid">
+              <button data-key-action="toggle-pause" class="secondary-button" type="button">Pause / Resume</button>
+              <button data-key-action="reset-hwid" class="secondary-button" type="button">Reset HWID</button>
+              <button data-key-action="blacklist" class="secondary-button" type="button">Blacklist</button>
+              <button data-key-action="jumpscare" class="secondary-button" type="button">Queue Jumpscare</button>
+              <button data-key-action="compensate" class="secondary-button" type="button">Compensate</button>
+              <button data-key-action="delete" class="danger-button" type="button">Delete Key</button>
+            </div>
+            <pre id="key-info-output" class="output-box empty">Load a key to inspect it.</pre>
+            <button id="delete-all-keys" class="danger-button wide-button" type="button">Delete All Keys</button>
+          </section>
+        </section>
+
+        <section class="panel-grid">
+          <section class="card">
+            <div class="card-header">
+              <h2>Recent Keys</h2>
+              <p>Newest keys in the backend. Click one to load it into the action panel.</p>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Sessions</th>
+                    <th>Last User</th>
+                    <th>Expires</th>
+                  </tr>
+                </thead>
+                <tbody id="recent-keys-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-header">
+              <h2>Service Actions</h2>
+              <p>Run the configured SSH-backed service commands from the panel.</p>
+            </div>
+            <div id="service-actions" class="action-grid"></div>
+            <pre id="service-output" class="output-box empty">No service action run yet.</pre>
+          </section>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <h2>Live Users</h2>
+            <p>Active sessions from the `presence` table, refreshed from the backend.</p>
+          </div>
+          <div class="toolbar">
+            <button id="refresh-users" class="ghost-button" type="button">Refresh Users</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Key</th>
+                  <th>Server</th>
+                  <th>Flags</th>
+                  <th>Position</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="users-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/panel/assets/panel.js" defer></script>
+</body>
+</html>

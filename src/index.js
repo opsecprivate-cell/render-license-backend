@@ -25,6 +25,9 @@ const DEFAULT_DISCORD_AUTO_MESSAGE_MODE = "stats";
 const DEFAULT_DISCORD_AUTO_MESSAGE_TEXT = "render is best in";
 const DEFAULT_DISCORD_AUTO_MESSAGE_INTERVAL_MS = 10 * 60 * 1000;
 const DEFAULT_DISCORD_RECONNECT_DELAY_MS = 30 * 1000;
+const DEFAULT_DISCORD_LOGIN_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_DISCORD_COMMAND_SYNC_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_PANEL_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_SERVICE_SSH_TIMEOUT_MS = 20 * 1000;
 
@@ -73,6 +76,26 @@ const CONFIG = {
     5 * 1000,
     toPositiveInt(process.env.DISCORD_RECONNECT_DELAY_MS, DEFAULT_DISCORD_RECONNECT_DELAY_MS)
   ),
+  discordLoginTimeoutMs: Math.max(
+    5 * 1000,
+    toPositiveInt(process.env.DISCORD_LOGIN_TIMEOUT_MS, DEFAULT_DISCORD_LOGIN_TIMEOUT_MS)
+  ),
+  discordCommandSyncTimeoutMs: Math.max(
+    5 * 1000,
+    toPositiveInt(process.env.DISCORD_COMMAND_SYNC_TIMEOUT_MS, DEFAULT_DISCORD_COMMAND_SYNC_TIMEOUT_MS)
+  ),
+  panelSessionCookieName: String(process.env.PANEL_SESSION_COOKIE_NAME || "render_admin_panel").trim() || "render_admin_panel",
+  panelSessionTtlMs: Math.max(
+    60 * 60 * 1000,
+    toPositiveInt(process.env.PANEL_SESSION_TTL_MS, DEFAULT_PANEL_SESSION_TTL_MS)
+  ),
+  panelSessionSecret: String(
+    process.env.PANEL_SESSION_SECRET ||
+    process.env.DISCORD_BOT_TOKEN ||
+    process.env.BOOTSTRAP_ADMIN_KEY ||
+    process.env.DATABASE_URL ||
+    "render-admin-panel"
+  ).trim(),
   serviceSshEnabled: String(process.env.SERVICE_SSH_ENABLED || "false").toLowerCase() === "true",
   serviceSshHost: String(process.env.SERVICE_SSH_HOST || "").trim(),
   serviceSshPort: toPositiveInt(process.env.SERVICE_SSH_PORT, 22),
@@ -106,12 +129,36 @@ let discordStartInProgress = false;
 let discordAutoMessageFailureCount = 0;
 let selfPingTimer = null;
 
+app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use("/panel/assets", express.static(path.resolve(__dirname, "..", "public"), { index: false }));
 
 app.get("/", (_req, res) => {
   res.status(200).send("Render license backend online");
 });
+app.get("/panel", asyncHandler(handlePanelPage));
+app.get("/panel/", asyncHandler(handlePanelPage));
+app.get("/panel/api/session", asyncHandler(handlePanelSession));
+app.post("/panel/api/login", asyncHandler(handlePanelLogin));
+app.post("/panel/api/logout", asyncHandler(handlePanelLogout));
+app.get("/panel/api/bootstrap", asyncHandler(handlePanelBootstrap));
+app.get("/panel/api/users", asyncHandler(handlePanelUsers));
+app.post("/panel/api/keys/generate", asyncHandler(handlePanelGenerateKeys));
+app.post("/panel/api/keys/info", asyncHandler(handlePanelKeyInfo));
+app.post("/panel/api/keys/compensate", asyncHandler(handlePanelCompensateKey));
+app.post("/panel/api/keys/toggle-pause", asyncHandler(handlePanelTogglePauseKey));
+app.post("/panel/api/keys/reset-hwid", asyncHandler(handlePanelResetHwid));
+app.post("/panel/api/keys/blacklist", asyncHandler(handlePanelBlacklistKey));
+app.post("/panel/api/keys/jumpscare", asyncHandler(handlePanelQueueJumpscare));
+app.post("/panel/api/keys/delete", asyncHandler(handlePanelDeleteKey));
+app.post("/panel/api/keys/delete-all", asyncHandler(handlePanelDeleteAllKeys));
+app.post("/panel/api/users/freeze", asyncHandler(handlePanelFreezeUser));
+app.post("/panel/api/users/blind", asyncHandler(handlePanelBlindUser));
+app.post("/panel/api/users/kick", asyncHandler(handlePanelKickUser));
+app.post("/panel/api/users/message", asyncHandler(handlePanelMessageUser));
+app.get("/panel/api/service-actions", asyncHandler(handlePanelServiceActions));
+app.post("/panel/api/service/run", asyncHandler(handlePanelRunServiceAction));
 app.get("/bootstrap-script", asyncHandler(handleBootstrapScript));
 
 app.post("/", asyncHandler(handleLicenseCheck));
@@ -123,9 +170,6 @@ app.post("/upload-script", (_req, res) => {
 app.post("/presence", asyncHandler(handlePresence));
 app.post("/chat/send", asyncHandler(handleChatSend));
 app.post("/chat/fetch", asyncHandler(handleChatFetch));
-app.post("/call/send", asyncHandler(handleCallSend));
-app.post("/call/fetch", asyncHandler(handleCallFetch));
-app.post("/typing/set", asyncHandler(handleTypingSet));
 app.post("/admin/users", asyncHandler(handleAdminUsers));
 app.post("/admin/kick", asyncHandler(handleAdminKick));
 app.post("/admin/freeze", asyncHandler(handleAdminFreeze));
@@ -497,66 +541,6 @@ async function handlePresence(req, res) {
   });
 }
 
-function parseRenderChatEnvelopeMeta(message) {
-  const raw = String(message || "");
-  if (!raw.startsWith("::r2::")) {
-    return { kind: "text", signalType: "" };
-  }
-  try {
-    const data = JSON.parse(raw.slice(6));
-    return {
-      kind: typeof data?.kind === "string" ? data.kind : "text",
-      signalType: typeof data?.signalType === "string" ? data.signalType : ""
-    };
-  } catch {
-    return { kind: "text", signalType: "" };
-  }
-}
-
-function normalizeChatIdentity(value, maxLength = 28) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-async function getRealtimeScope(sessionToken, body) {
-  const myPresence = await queryOne(
-    "SELECT username, server, server_id FROM presence WHERE session_id = $1",
-    [sessionToken]
-  );
-  const targetServerId = normalizeServerId(body?.serverId) || normalizeServerId(myPresence?.server_id);
-  const targetServerName = normalizeServerLabel(body?.server || myPresence?.server);
-  return {
-    username: normalizeChatIdentity(myPresence?.username, 28),
-    serverId: targetServerId || "",
-    serverName: targetServerName || "",
-    presence: myPresence || null
-  };
-}
-
-function matchesRealtimeScope(scope, serverId, serverName) {
-  const normalizedServerId = normalizeServerId(serverId);
-  const normalizedServerName = normalizeServerLabel(serverName);
-  if (scope.serverId) {
-    return normalizedServerId === scope.serverId;
-  }
-  if (scope.serverName) {
-    return normalizedServerName === scope.serverName;
-  }
-  return true;
-}
-
-function isCrossScopeRealtimeSignal(signalType) {
-  const normalized = normalizeChatIdentity(signalType, 24).toLowerCase();
-  return normalized.startsWith("screen");
-}
-
-async function cleanupRealtimeRows(now = Date.now()) {
-  await query("DELETE FROM call_signal_queue WHERE created_at < $1", [now - 120000]);
-  await query("DELETE FROM typing_state WHERE last_seen < $1", [now - 10000]);
-}
-
 async function handleChatSend(req, res) {
   const body = req.body || {};
   const sessionToken = String(body.sessionToken || "").trim();
@@ -577,29 +561,19 @@ async function handleChatSend(req, res) {
     "SELECT username, server FROM presence WHERE session_id = $1",
     [sessionToken]
   );
-  const bodyUsername = normalizeChatIdentity(body.username, 28);
-  const bodyServer = normalizeServerLabel(body.server);
-  const senderName = bodyUsername || normalizeChatIdentity(presence?.username, 28) || "Unknown";
-  const senderServer = bodyServer || normalizeServerLabel(presence?.server) || "Unknown";
-  const envelopeMeta = parseRenderChatEnvelopeMeta(message);
-  const isRealtimeSignal = envelopeMeta.kind === "signal";
+  const fallbackUsername = String(body.username || "Unknown").trim() || "Unknown";
+  const fallbackServer = String(body.server || "Unknown").trim() || "Unknown";
+  const senderName = String(presence?.username || fallbackUsername).trim() || "Unknown";
+  const senderServer = String(presence?.server || fallbackServer).trim() || "Unknown";
 
   const now = Date.now();
   const recent = await queryOne(
-    "SELECT timestamp, message FROM chat WHERE sender_key = $1 ORDER BY timestamp DESC LIMIT 1",
+    "SELECT timestamp FROM chat WHERE sender_key = $1 ORDER BY timestamp DESC LIMIT 1",
     [session.session.key_id]
   );
-  if (recent) {
-    const recentAt = Number(recent.timestamp || 0);
-    const recentMessage = String(recent.message || "");
-    if (recentMessage === message && now - recentAt < (isRealtimeSignal ? 1500 : 2500)) {
-      res.json({ success: true, deduped: true });
-      return;
-    }
-    if (!isRealtimeSignal && now - recentAt < 600) {
-      res.status(429).json({ error: "Rate limited" });
-      return;
-    }
+  if (recent && now - Number(recent.timestamp) < 2000) {
+    res.status(429).json({ error: "Rate limited" });
+    return;
   }
 
   await query(
@@ -655,20 +629,7 @@ async function handleChatFetch(req, res) {
   } : null;
 
   const messagesResult = await query(
-    `
-      SELECT
-        chat.sender_key,
-        chat.sender_name,
-        chat.server,
-        chat.message,
-        chat.timestamp,
-        COALESCE(keys.is_admin, FALSE) AS sender_is_admin
-      FROM chat
-      LEFT JOIN keys ON keys.key_id = chat.sender_key
-      WHERE chat.timestamp > $1
-      ORDER BY chat.timestamp ASC
-      LIMIT 50
-    `,
+    "SELECT sender_name, server, message, timestamp FROM chat WHERE timestamp > $1 ORDER BY timestamp ASC LIMIT 50",
     [since]
   );
   const usersResult = await query(
@@ -682,168 +643,25 @@ async function handleChatFetch(req, res) {
   );
 
   const users = usersResult.rows;
-  const serverUsers = usersResult.rows;
-  const messages = messagesResult.rows;
+  const serverUsers = serverScope
+    ? users.filter((user) => {
+      const sameServerId = serverScope.serverId && normalizeServerId(user.server_id) === serverScope.serverId;
+      const sameServerName = serverScope.serverName && normalizeServerLabel(user.server) === serverScope.serverName;
+      return sameServerId || sameServerName;
+    })
+    : users;
+  const messages = serverScope && serverScope.serverName
+    ? messagesResult.rows.filter((message) => {
+      const sameServerName = serverScope.serverName && normalizeServerLabel(message.server) === serverScope.serverName;
+      return sameServerName;
+    })
+    : messagesResult.rows;
 
   res.json({
     messages,
-    users,
-    serverUsers,
-    globalChat: true
+    users: serverScope ? serverUsers : users,
+    serverUsers
   });
-}
-
-async function handleCallSend(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/call/send", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const signalType = normalizeChatIdentity(body.signalType, 24).toLowerCase();
-  const allowedSignalTypes = new Set(["offer", "answer", "ice", "hangup", "decline", "busy", "adminok", "adminno", "screenoffer", "screenanswer", "screenice", "screenhangup", "screendecline", "screenbusy"]);
-  const targetUser = normalizeChatIdentity(body.targetUser, 28);
-  const payload = typeof body.payload === "string" ? body.payload : JSON.stringify(body.payload || {});
-  if (!targetUser || !allowedSignalTypes.has(signalType) || !payload || payload.length > 40000) {
-    res.status(400).json({ error: "Invalid call signal" });
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const senderName = normalizeChatIdentity(body.username, 28) || scope.username || "Unknown";
-  const senderServer = String(scope.presence?.server || body.server || "Unknown").trim() || "Unknown";
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-  await query(
-    `
-      INSERT INTO call_signal_queue (sender_key, sender_name, target_user, server, server_id, signal_type, payload, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `,
-    [session.session.key_id, senderName, targetUser, senderServer, scope.serverId || "", signalType, payload, now]
-  );
-  res.json({ success: true });
-}
-
-async function handleCallFetch(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/call/fetch", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const requestedUsername = normalizeChatIdentity(body.username, 28) || scope.username;
-  const sinceId = Math.max(0, Number(body.lastSignalId || 0));
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-
-  const rawSignals = await query(
-    `
-      SELECT id, sender_name, target_user, server, server_id, signal_type, payload, created_at
-      FROM call_signal_queue
-      WHERE id > $1 AND target_user = $2
-      ORDER BY id ASC
-      LIMIT 200
-    `,
-    [sinceId, requestedUsername]
-  );
-  const signals = rawSignals.rows
-    .filter((row) => isCrossScopeRealtimeSignal(row.signal_type) || matchesRealtimeScope(scope, row.server_id, row.server))
-    .map((row) => ({
-      id: Number(row.id || 0),
-      senderName: normalizeChatIdentity(row.sender_name, 28),
-      targetUser: normalizeChatIdentity(row.target_user, 28),
-      signalType: normalizeChatIdentity(row.signal_type, 24).toLowerCase(),
-      payload: String(row.payload || ""),
-      createdAt: Number(row.created_at || 0)
-    }));
-
-  const typingRows = await query(
-    `
-      SELECT sender_name, target_user, server, server_id, last_seen
-      FROM typing_state
-      WHERE last_seen > $1
-      ORDER BY last_seen DESC
-    `,
-    [now - 3500]
-  );
-  const typingUsers = [];
-  const typingSeen = new Set();
-  for (const row of typingRows.rows) {
-    if (!matchesRealtimeScope(scope, row.server_id, row.server)) {
-      continue;
-    }
-    const senderName = normalizeChatIdentity(row.sender_name, 28);
-    const targetUser = normalizeChatIdentity(row.target_user, 28);
-    if (!senderName || senderName === requestedUsername) {
-      continue;
-    }
-    const direct = !!targetUser;
-    if (direct && targetUser !== requestedUsername) {
-      continue;
-    }
-    const key = `${senderName}|${direct ? "direct" : "public"}`;
-    if (typingSeen.has(key)) {
-      continue;
-    }
-    typingSeen.add(key);
-    typingUsers.push({
-      user: senderName,
-      direct,
-      targetUser,
-      lastSeen: Number(row.last_seen || 0)
-    });
-  }
-
-  res.json({ signals, typingUsers });
-}
-
-async function handleTypingSet(req, res) {
-  const body = req.body || {};
-  const sessionToken = String(body.sessionToken || "").trim();
-  const hwid = normalizeHwid(body.hwid);
-  const session = await getSessionForEndpoint(req, sessionToken, hwid, "/typing/set", body);
-  if (!session.ok) {
-    res.status(session.status).json(session.body);
-    return;
-  }
-
-  const scope = await getRealtimeScope(sessionToken, body);
-  const senderName = normalizeChatIdentity(body.username, 28) || scope.username || "Unknown";
-  const senderServer = String(scope.presence?.server || body.server || "Unknown").trim() || "Unknown";
-  const targetUser = normalizeChatIdentity(body.targetUser, 28);
-  const active = Boolean(body.active);
-  const now = Date.now();
-  await cleanupRealtimeRows(now);
-  if (!active) {
-    await query(
-      `
-        DELETE FROM typing_state
-        WHERE sender_key = $1 AND target_user = $2 AND server = $3 AND server_id = $4
-      `,
-      [session.session.key_id, targetUser, senderServer, scope.serverId || ""]
-    );
-    res.json({ success: true });
-    return;
-  }
-
-  await query(
-    `
-      INSERT INTO typing_state (sender_key, sender_name, target_user, server, server_id, last_seen)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (sender_key, target_user, server, server_id) DO UPDATE SET
-        sender_name = EXCLUDED.sender_name,
-        last_seen = EXCLUDED.last_seen
-    `,
-    [session.session.key_id, senderName, targetUser, senderServer, scope.serverId || "", now]
-  );
-  res.json({ success: true });
 }
 
 async function handleAdminUsers(req, res) {
@@ -965,6 +783,970 @@ async function handlePresenceFlagUpdate(req, res, endpoint, column, value) {
   res.json({ success: true });
 }
 
+async function handlePanelPage(_req, res) {
+  res.sendFile(path.resolve(__dirname, "..", "public", "panel.html"));
+}
+
+async function handlePanelSession(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json({ authenticated: false, error: access.body.error || "Unauthorized" });
+    return;
+  }
+  res.json({ authenticated: true, session: toPanelSessionResponse(access.adminKey) });
+}
+
+async function handlePanelLogin(req, res) {
+  const adminKeyInput = String(req.body?.adminKey || "");
+  const adminKey = await resolvePanelAdminKey(adminKeyInput);
+  if (!adminKey.ok) {
+    res.status(adminKey.status).json({ success: false, error: adminKey.error });
+    return;
+  }
+
+  setPanelSessionCookie(req, res, adminKey.key.key_id);
+  res.json({
+    success: true,
+    session: toPanelSessionResponse(adminKey.key)
+  });
+}
+
+async function handlePanelLogout(req, res) {
+  clearPanelSessionCookie(req, res);
+  res.json({ success: true });
+}
+
+async function handlePanelBootstrap(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const [stats, recentKeys, users] = await Promise.all([
+    buildStatsSnapshot(),
+    listRecentKeys(25),
+    listLiveUsers()
+  ]);
+
+  res.json({
+    session: toPanelSessionResponse(access.adminKey),
+    stats,
+    recentKeys,
+    users,
+    serviceActions: getConfiguredServiceActions(),
+    serviceEnabled: CONFIG.serviceSshEnabled,
+    serviceConfigured: isServiceSshConfigured()
+  });
+}
+
+async function handlePanelUsers(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+  res.json({ users: await listLiveUsers() });
+}
+
+async function handlePanelGenerateKeys(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const generated = await runPanelOperation(res, () => generateKeysForPanel({
+    amount: req.body?.amount,
+    duration: req.body?.duration,
+    shared: req.body?.shared,
+    maxUses: req.body?.maxUses,
+    isAdmin: req.body?.isAdmin
+  }));
+  if (!generated) {
+    return;
+  }
+  res.json({ success: true, generated });
+}
+
+async function handlePanelKeyInfo(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const keyInfo = await runPanelOperation(res, () => buildPanelKeyInfo(String(req.body?.key || "")));
+  if (!keyInfo) {
+    return;
+  }
+  res.json({ success: true, key: keyInfo });
+}
+
+async function handlePanelCompensateKey(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => compensateKeyForPanel(String(req.body?.key || ""), req.body?.days));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelTogglePauseKey(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => togglePauseKeyForPanel(String(req.body?.key || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelResetHwid(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => resetKeyHwidForPanel(String(req.body?.key || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelBlacklistKey(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => blacklistKeyForPanel(String(req.body?.key || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelQueueJumpscare(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => queueJumpscareForPanel(String(req.body?.key || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelDeleteKey(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => deleteKeyForPanel(String(req.body?.key || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelDeleteAllKeys(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => deleteAllKeysForPanel());
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelFreezeUser(req, res) {
+  await handlePanelPresenceFlag(req, res, "frozen", Boolean(req.body?.freeze));
+}
+
+async function handlePanelBlindUser(req, res) {
+  await handlePanelPresenceFlag(req, res, "blinded", Boolean(req.body?.blind));
+}
+
+async function handlePanelPresenceFlag(req, res, column, value) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(
+    res,
+    () => setPresenceFlagForPanel(String(req.body?.targetSession || ""), column, value)
+  );
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelKickUser(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => kickUserForPanel(String(req.body?.targetSession || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelMessageUser(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(
+    res,
+    () => setAdminMessageForPanel(
+      String(req.body?.targetSession || ""),
+      String(req.body?.message || "")
+    )
+  );
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+async function handlePanelServiceActions(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  res.json({
+    actions: getConfiguredServiceActions(),
+    enabled: CONFIG.serviceSshEnabled,
+    configured: isServiceSshConfigured(),
+    host: CONFIG.serviceSshHost,
+    port: CONFIG.serviceSshPort
+  });
+}
+
+async function handlePanelRunServiceAction(req, res) {
+  const access = await getPanelAdminAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+
+  const result = await runPanelOperation(res, () => runServiceActionForPanel(String(req.body?.action || "")));
+  if (!result) {
+    return;
+  }
+  res.json({ success: true, result });
+}
+
+function parseCookies(req) {
+  const cookieHeader = String(req.headers?.cookie || "");
+  const cookies = {};
+  for (const segment of cookieHeader.split(";")) {
+    const trimmed = segment.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+    const name = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    cookies[name] = value;
+  }
+  return cookies;
+}
+
+function encodeBase64UrlUtf8(value) {
+  return Buffer.from(String(value || ""), "utf8").toString("base64url");
+}
+
+function decodeBase64UrlUtf8(value) {
+  return Buffer.from(String(value || ""), "base64url").toString("utf8");
+}
+
+function signPanelSessionPayload(encodedPayload) {
+  return crypto
+    .createHmac("sha256", CONFIG.panelSessionSecret)
+    .update(String(encodedPayload || ""))
+    .digest("base64url");
+}
+
+function createPanelSessionValue(keyId) {
+  const payload = {
+    keyId: normalizeKey(keyId),
+    exp: Date.now() + CONFIG.panelSessionTtlMs
+  };
+  const encodedPayload = encodeBase64UrlUtf8(JSON.stringify(payload));
+  return `${encodedPayload}.${signPanelSessionPayload(encodedPayload)}`;
+}
+
+function readPanelSession(req) {
+  const cookies = parseCookies(req);
+  const rawValue = cookies[CONFIG.panelSessionCookieName];
+  if (!rawValue) {
+    return { ok: false, error: "Missing admin session" };
+  }
+
+  const separatorIndex = rawValue.lastIndexOf(".");
+  if (separatorIndex <= 0) {
+    return { ok: false, error: "Invalid admin session" };
+  }
+
+  const encodedPayload = rawValue.slice(0, separatorIndex);
+  const signature = rawValue.slice(separatorIndex + 1);
+  const expectedSignature = signPanelSessionPayload(encodedPayload);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  const actualBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== actualBuffer.length || !crypto.timingSafeEqual(expectedBuffer, actualBuffer)) {
+    return { ok: false, error: "Invalid admin session signature" };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(decodeBase64UrlUtf8(encodedPayload));
+  } catch {
+    return { ok: false, error: "Unreadable admin session" };
+  }
+
+  const keyId = normalizeKey(payload?.keyId);
+  const expiresAt = Number(payload?.exp);
+  if (!keyId || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    return { ok: false, error: "Expired admin session" };
+  }
+
+  return {
+    ok: true,
+    keyId,
+    expiresAt
+  };
+}
+
+function isSecureRequest(req) {
+  if (req.secure) {
+    return true;
+  }
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  return forwardedProto === "https";
+}
+
+function writeCookie(res, name, value, options = {}) {
+  const parts = [`${name}=${value}`];
+  parts.push(`Path=${options.path || "/"}`);
+  if (Number.isFinite(Number(options.maxAge))) {
+    parts.push(`Max-Age=${Math.max(0, Math.floor(Number(options.maxAge)))}`);
+  }
+  if (options.httpOnly !== false) {
+    parts.push("HttpOnly");
+  }
+  if (options.sameSite) {
+    parts.push(`SameSite=${options.sameSite}`);
+  }
+  if (options.secure) {
+    parts.push("Secure");
+  }
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function setPanelSessionCookie(req, res, keyId) {
+  writeCookie(res, CONFIG.panelSessionCookieName, createPanelSessionValue(keyId), {
+    path: "/",
+    maxAge: Math.floor(CONFIG.panelSessionTtlMs / 1000),
+    httpOnly: true,
+    sameSite: "Lax",
+    secure: isSecureRequest(req)
+  });
+}
+
+function clearPanelSessionCookie(req, res) {
+  writeCookie(res, CONFIG.panelSessionCookieName, "", {
+    path: "/",
+    maxAge: 0,
+    httpOnly: true,
+    sameSite: "Lax",
+    secure: isSecureRequest(req)
+  });
+}
+
+async function resolvePanelAdminKey(rawKey) {
+  const keyId = normalizeKey(rawKey);
+  if (!keyId) {
+    return { ok: false, status: 400, error: "Invalid admin key" };
+  }
+
+  const key = await queryOne(
+    `
+      SELECT key_id, expires, paused, is_admin, created_at
+      FROM keys
+      WHERE key_id = $1
+    `,
+    [keyId]
+  );
+  if (!key?.is_admin) {
+    return { ok: false, status: 401, error: "Admin key not found" };
+  }
+
+  const blacklisted = await queryOne("SELECT 1 FROM blacklist WHERE key_id = $1", [keyId]);
+  if (blacklisted) {
+    return { ok: false, status: 403, error: "Admin key is blacklisted" };
+  }
+  if (Boolean(key.paused)) {
+    return { ok: false, status: 403, error: "Admin key is paused" };
+  }
+  if (isKeyExpired(key.expires)) {
+    return { ok: false, status: 403, error: "Admin key is expired" };
+  }
+
+  return { ok: true, key };
+}
+
+async function getPanelAdminAccess(req) {
+  const session = readPanelSession(req);
+  if (!session.ok) {
+    return { ok: false, status: 401, body: { authenticated: false, error: session.error } };
+  }
+
+  const adminKey = await resolvePanelAdminKey(session.keyId);
+  if (!adminKey.ok) {
+    return { ok: false, status: adminKey.status, body: { authenticated: false, error: adminKey.error } };
+  }
+
+  return { ok: true, adminKey: adminKey.key };
+}
+
+function toPanelSessionResponse(adminKey) {
+  return {
+    keyId: adminKey.key_id,
+    displayKey: formatAdminKeyForDisplay(adminKey.key_id),
+    expiresAt: parseExpiryMs(adminKey.expires),
+    createdAt: adminKey.created_at || null
+  };
+}
+
+function getPanelOperationStatus(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("not found")) {
+    return 404;
+  }
+  if (
+    message.includes("invalid") ||
+    message.includes("unknown") ||
+    message.includes("expired") ||
+    message.includes("paused") ||
+    message.includes("blacklisted") ||
+    message.includes("disabled") ||
+    message.includes("configured") ||
+    message.includes("lifetime")
+  ) {
+    return 400;
+  }
+  return 500;
+}
+
+async function runPanelOperation(res, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    res.status(getPanelOperationStatus(error)).json({
+      success: false,
+      error: error?.message || "Request failed"
+    });
+    return null;
+  }
+}
+
+async function buildStatsSnapshot() {
+  const [total, single, shared, activeSessions, activations, admins] = await Promise.all([
+    queryOne("SELECT COUNT(*)::int AS c FROM keys"),
+    queryOne("SELECT COUNT(*)::int AS c FROM keys WHERE NOT COALESCE(shared, FALSE) AND NOT COALESCE(is_admin, FALSE)"),
+    queryOne("SELECT COUNT(*)::int AS c FROM keys WHERE COALESCE(shared, FALSE)"),
+    queryOne("SELECT COUNT(*)::int AS c FROM sessions"),
+    queryOne("SELECT COUNT(*)::int AS c FROM key_activations"),
+    queryOne("SELECT COUNT(*)::int AS c FROM keys WHERE COALESCE(is_admin, FALSE)")
+  ]);
+
+  return {
+    totalKeys: Number(total?.c || 0),
+    singleKeys: Number(single?.c || 0),
+    sharedKeys: Number(shared?.c || 0),
+    adminKeys: Number(admins?.c || 0),
+    liveSessions: Number(activeSessions?.c || 0),
+    sharedActivations: Number(activations?.c || 0)
+  };
+}
+
+async function listRecentKeys(limit = 25) {
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 25));
+  const now = Date.now();
+  const result = await query(
+    `
+      SELECT
+        k.key_id,
+        k.expires,
+        k.hwid,
+        k.paused,
+        k.is_admin,
+        k.shared,
+        k.max_uses,
+        k.last_hwid,
+        k.last_ip,
+        k.last_username,
+        k.last_server,
+        k.last_seen_at,
+        k.created_at,
+        EXISTS (SELECT 1 FROM blacklist b WHERE b.key_id = k.key_id) AS blacklisted,
+        (
+          SELECT COUNT(*)::int
+          FROM sessions s
+          WHERE s.key_id = k.key_id AND s.expires > $1
+        ) AS live_sessions,
+        (
+          SELECT COUNT(*)::int
+          FROM key_activations a
+          WHERE a.key_id = k.key_id
+        ) AS activation_count
+      FROM keys k
+      ORDER BY k.created_at DESC
+      LIMIT $2
+    `,
+    [now, safeLimit]
+  );
+
+  return result.rows.map((row) => ({
+    keyId: row.key_id,
+    displayKey: row.is_admin ? formatAdminKeyForDisplay(row.key_id) : formatKeyForDisplay(row.key_id),
+    isAdmin: Boolean(row.is_admin),
+    shared: Boolean(row.shared),
+    paused: Boolean(row.paused),
+    blacklisted: Boolean(row.blacklisted),
+    expiresAt: parseExpiryMs(row.expires),
+    maxUses: Number(row.max_uses || 0),
+    hwid: row.hwid || null,
+    lastHwid: row.last_hwid || null,
+    lastIp: row.last_ip || null,
+    lastUsername: row.last_username || null,
+    lastServer: row.last_server || null,
+    lastSeenAt: parseExpiryMs(row.last_seen_at),
+    createdAt: row.created_at || null,
+    liveSessions: Number(row.live_sessions || 0),
+    activationCount: Number(row.activation_count || 0)
+  }));
+}
+
+async function listLiveUsers() {
+  const usersResult = await query(
+    `
+      SELECT session_id, key_id, username, server, server_id, player_x, player_y, frozen, blinded, admin_message, last_seen
+      FROM presence
+      WHERE last_seen > $1
+      ORDER BY server, username
+    `,
+    [Date.now() - 30000]
+  );
+
+  return usersResult.rows.map((row) => ({
+    sessionId: row.session_id,
+    keyId: row.key_id,
+    displayKey: formatKeyForDisplay(row.key_id),
+    username: row.username,
+    server: row.server,
+    serverId: row.server_id,
+    playerX: Number(row.player_x || 0),
+    playerY: Number(row.player_y || 0),
+    frozen: Boolean(row.frozen),
+    blinded: Boolean(row.blinded),
+    adminMessage: row.admin_message || null,
+    lastSeen: Number(row.last_seen || 0)
+  }));
+}
+
+async function generateKeysForPanel({ amount, duration, shared, maxUses, isAdmin }) {
+  const parsed = getKeyExpiryFromDuration(duration || "lifetime");
+  if (!parsed.ok) {
+    throw new Error(parsed.error);
+  }
+
+  const adminMode = Boolean(isAdmin);
+  const keyCount = adminMode ? 1 : Math.max(1, Math.min(50, Number(amount) || 1));
+  const sharedMode = adminMode ? false : Boolean(shared);
+  const usageLimit = sharedMode ? Math.max(0, Math.min(100000, Number(maxUses) || 0)) : 0;
+  const generatedKeys = [];
+
+  for (let index = 0; index < keyCount; index += 1) {
+    generatedKeys.push(await createUniqueKey({
+      prefix: adminMode ? "ADMIN" : "MOPE",
+      formatter: adminMode ? formatAdminKeyForDisplay : formatKeyForDisplay,
+      expires: parsed.expires,
+      shared: sharedMode,
+      maxUses: usageLimit,
+      isAdmin: adminMode
+    }));
+  }
+
+  return {
+    duration: parsed.duration,
+    expiresAt: parsed.expires,
+    isAdmin: adminMode,
+    shared: sharedMode,
+    maxUses: usageLimit,
+    keys: generatedKeys
+  };
+}
+
+async function buildPanelKeyInfo(rawKey) {
+  const key = normalizeKey(rawKey);
+  if (!key) {
+    throw new Error("Invalid key");
+  }
+
+  const data = await queryOne("SELECT * FROM keys WHERE key_id = $1", [key]);
+  if (!data) {
+    throw new Error("Key not found");
+  }
+
+  const isShared = Boolean(data.shared);
+  const [usage, liveSessions, livePresence, blacklisted] = await Promise.all([
+    isShared
+      ? queryOne("SELECT COUNT(*)::int AS c FROM key_activations WHERE key_id = $1", [key])
+      : Promise.resolve(null),
+    queryOne("SELECT COUNT(*)::int AS c FROM sessions WHERE key_id = $1 AND expires > $2", [key, Date.now()]),
+    queryOne(
+      `
+        SELECT username, server, server_id, last_seen, frozen, blinded, admin_message
+        FROM presence
+        WHERE key_id = $1
+        ORDER BY last_seen DESC
+        LIMIT 1
+      `,
+      [key]
+    ),
+    queryOne("SELECT 1 FROM blacklist WHERE key_id = $1", [key])
+  ]);
+
+  return {
+    keyId: data.key_id,
+    displayKey: data.is_admin ? formatAdminKeyForDisplay(data.key_id) : formatKeyForDisplay(data.key_id),
+    isAdmin: Boolean(data.is_admin),
+    shared: isShared,
+    paused: Boolean(data.paused),
+    blacklisted: Boolean(blacklisted),
+    expiresAt: parseExpiryMs(data.expires),
+    hwid: data.hwid || null,
+    lastHwid: data.last_hwid || data.hwid || null,
+    lastIp: data.last_ip || null,
+    lastUsername: data.last_username || livePresence?.username || null,
+    lastServer: data.last_server || livePresence?.server || null,
+    lastServerId: data.last_server_id || livePresence?.server_id || null,
+    lastSeenAt: parseExpiryMs(data.last_seen_at),
+    createdAt: data.created_at || null,
+    liveSessions: Number(liveSessions?.c || 0),
+    maxUses: Number(data.max_uses || 0),
+    activationCount: Number(usage?.c || 0),
+    jumpscareQueued: Boolean(data.jumpscare),
+    onlineNow: livePresence
+      ? {
+          username: livePresence.username,
+          server: livePresence.server,
+          serverId: livePresence.server_id,
+          lastSeen: Number(livePresence.last_seen || 0),
+          frozen: Boolean(livePresence.frozen),
+          blinded: Boolean(livePresence.blinded),
+          adminMessage: livePresence.admin_message || null
+        }
+      : null
+  };
+}
+
+async function compensateKeyForPanel(rawKey, daysInput) {
+  const key = normalizeKey(rawKey);
+  const days = Math.max(1, Math.min(3650, Number(daysInput) || 0));
+  if (!key || !days) {
+    throw new Error("Invalid key or days");
+  }
+
+  const data = await queryOne("SELECT expires FROM keys WHERE key_id = $1", [key]);
+  if (!data) {
+    throw new Error("Key not found");
+  }
+  if (isMissingExpiryValue(data.expires)) {
+    throw new Error("Lifetime keys do not need compensation");
+  }
+
+  const currentExpiry = parseExpiryMs(data.expires);
+  if (!currentExpiry) {
+    throw new Error("Stored expiry is invalid");
+  }
+
+  const nextExpiry = Math.max(currentExpiry, Date.now()) + (days * 24 * 60 * 60 * 1000);
+  await query("UPDATE keys SET expires = $1 WHERE key_id = $2", [nextExpiry, key]);
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key),
+    daysAdded: days,
+    previousExpiry: currentExpiry,
+    nextExpiry
+  };
+}
+
+async function togglePauseKeyForPanel(rawKey) {
+  const key = normalizeKey(rawKey);
+  const data = await queryOne("SELECT paused FROM keys WHERE key_id = $1", [key]);
+  if (!data) {
+    throw new Error("Key not found");
+  }
+  const paused = !Boolean(data.paused);
+  await query("UPDATE keys SET paused = $1 WHERE key_id = $2", [paused, key]);
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key),
+    paused
+  };
+}
+
+async function resetKeyHwidForPanel(rawKey) {
+  const key = normalizeKey(rawKey);
+  const data = await queryOne("SELECT shared FROM keys WHERE key_id = $1", [key]);
+  if (!data) {
+    throw new Error("Key not found");
+  }
+
+  if (data.shared) {
+    await query("DELETE FROM sessions WHERE key_id = $1", [key]);
+    await query("DELETE FROM presence WHERE key_id = $1", [key]);
+    await query("DELETE FROM key_activations WHERE key_id = $1", [key]);
+  } else {
+    await query("UPDATE keys SET hwid = NULL WHERE key_id = $1", [key]);
+    await query("DELETE FROM sessions WHERE key_id = $1", [key]);
+    await query("DELETE FROM presence WHERE key_id = $1", [key]);
+  }
+  await query("DELETE FROM kicked_clients WHERE key_id = $1", [key]);
+
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key),
+    shared: Boolean(data.shared)
+  };
+}
+
+async function blacklistKeyForPanel(rawKey) {
+  const key = normalizeKey(rawKey);
+  const exists = await queryOne("SELECT 1 FROM keys WHERE key_id = $1", [key]);
+  if (!exists) {
+    throw new Error("Key not found");
+  }
+
+  await query(
+    `
+      INSERT INTO blacklist (key_id)
+      VALUES ($1)
+      ON CONFLICT (key_id) DO NOTHING
+    `,
+    [key]
+  );
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key)
+  };
+}
+
+async function queueJumpscareForPanel(rawKey) {
+  const key = normalizeKey(rawKey);
+  const updated = await query("UPDATE keys SET jumpscare = TRUE WHERE key_id = $1", [key]);
+  if (updated.rowCount === 0) {
+    throw new Error("Key not found");
+  }
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key)
+  };
+}
+
+async function deleteKeyForPanel(rawKey) {
+  const key = normalizeKey(rawKey);
+  if (!key) {
+    throw new Error("Invalid key");
+  }
+
+  await query("DELETE FROM sessions WHERE key_id = $1", [key]);
+  await query("DELETE FROM presence WHERE key_id = $1", [key]);
+  await query("DELETE FROM key_activations WHERE key_id = $1", [key]);
+  await query("DELETE FROM kicked_clients WHERE key_id = $1", [key]);
+  await query("DELETE FROM blacklist WHERE key_id = $1", [key]);
+  const deleted = await query("DELETE FROM keys WHERE key_id = $1", [key]);
+  if (deleted.rowCount === 0) {
+    throw new Error("Key not found");
+  }
+
+  return {
+    keyId: key,
+    displayKey: formatKeyForDisplay(key)
+  };
+}
+
+async function deleteAllKeysForPanel() {
+  await query("DELETE FROM sessions");
+  await query("DELETE FROM presence");
+  await query("DELETE FROM chat");
+  await query("DELETE FROM key_activations");
+  await query("DELETE FROM kicked_clients");
+  await query("DELETE FROM blacklist");
+  const deletedKeys = await query("DELETE FROM keys");
+
+  return {
+    deletedKeys: deletedKeys.rowCount
+  };
+}
+
+async function setPresenceFlagForPanel(targetSession, column, value) {
+  const sessionId = String(targetSession || "").trim();
+  if (!sessionId) {
+    throw new Error("Invalid target session");
+  }
+
+  const updated = await query(`UPDATE presence SET ${column} = $1 WHERE session_id = $2`, [value, sessionId]);
+  if (updated.rowCount === 0) {
+    throw new Error("Session not found");
+  }
+
+  return {
+    sessionId,
+    column,
+    value: Boolean(value)
+  };
+}
+
+async function kickUserForPanel(targetSession) {
+  const sessionId = String(targetSession || "").trim();
+  if (!sessionId) {
+    throw new Error("Invalid target session");
+  }
+
+  const target = await queryOne("SELECT key_id, hwid FROM sessions WHERE token = $1", [sessionId]);
+  if (!target) {
+    throw new Error("Session not found");
+  }
+
+  const now = Date.now();
+  const lockUntil = now + CONFIG.adminKickLockMs;
+  const tokenRows = await query("SELECT token FROM sessions WHERE key_id = $1 AND hwid = $2", [
+    target.key_id,
+    target.hwid
+  ]);
+  const targetTokens = tokenRows.rows.map((row) => row.token);
+
+  await query(
+    `
+      INSERT INTO kicked_clients (key_id, hwid, expires_at, reason, created_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (key_id, hwid) DO UPDATE SET
+        expires_at = EXCLUDED.expires_at,
+        reason = EXCLUDED.reason,
+        created_at = EXCLUDED.created_at
+    `,
+    [target.key_id, target.hwid, lockUntil, "admin_kick", now]
+  );
+
+  await query("DELETE FROM sessions WHERE key_id = $1 AND hwid = $2", [target.key_id, target.hwid]);
+  if (targetTokens.length > 0) {
+    await query("DELETE FROM presence WHERE session_id = ANY($1::text[])", [targetTokens]);
+  }
+
+  return {
+    sessionId,
+    removedSessions: targetTokens.length,
+    lockExpiresAt: lockUntil
+  };
+}
+
+async function setAdminMessageForPanel(targetSession, message) {
+  const sessionId = String(targetSession || "").trim();
+  const nextMessage = String(message || "");
+  if (!sessionId) {
+    throw new Error("Invalid target session");
+  }
+  if (!nextMessage || nextMessage.length > 200) {
+    throw new Error("Invalid message");
+  }
+
+  const updated = await query("UPDATE presence SET admin_message = $1 WHERE session_id = $2", [
+    nextMessage,
+    sessionId
+  ]);
+  if (updated.rowCount === 0) {
+    throw new Error("Session not found");
+  }
+
+  return {
+    sessionId,
+    message: nextMessage
+  };
+}
+
+async function runServiceActionForPanel(rawAction) {
+  if (!CONFIG.serviceSshEnabled) {
+    throw new Error("Service SSH is disabled");
+  }
+  if (!isServiceSshConfigured()) {
+    throw new Error("Service SSH is not configured");
+  }
+
+  const actionKey = normalizeServiceAction(rawAction);
+  if (!actionKey) {
+    throw new Error("Invalid service action");
+  }
+
+  const command = CONFIG.serviceSshCommandMap.get(actionKey);
+  if (!command) {
+    throw new Error(`Unknown service action: ${actionKey}`);
+  }
+
+  const startedAt = Date.now();
+  const result = await runServiceSshCommand(command);
+  return {
+    action: actionKey,
+    target: `${CONFIG.serviceSshHost}:${CONFIG.serviceSshPort}`,
+    durationMs: Date.now() - startedAt,
+    exitCode: result.code,
+    signal: result.signal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    success: result.code === 0
+  };
+}
+
 async function getAdminAccess(req, endpoint) {
   const body = req.body || {};
   const sessionToken = String(body.sessionToken || "").trim();
@@ -1006,41 +1788,36 @@ async function getSessionForEndpoint(req, sessionToken, hwid, endpoint, body) {
 }
 
 async function getScriptSource(req) {
-  try {
-    const stat = await fs.stat(CONFIG.scriptSourcePath);
-    if (stat.mtimeMs !== scriptCache.mtimeMs) {
-      scriptCache = {
-        mtimeMs: stat.mtimeMs,
-        content: await fs.readFile(CONFIG.scriptSourcePath, "utf8")
-      };
+  if (CONFIG.scriptSourceUrl) {
+    const headers = {};
+    if (CONFIG.scriptSourceUserAgent) {
+      headers["User-Agent"] = CONFIG.scriptSourceUserAgent;
     }
-    return rewriteScriptServerUrl(scriptCache.content, req);
-  } catch (localError) {
-    if (!CONFIG.scriptSourceUrl) {
-      throw localError;
+    if (CONFIG.scriptSourceAccept) {
+      headers.Accept = CONFIG.scriptSourceAccept;
     }
-    console.warn(`Local script source unavailable, falling back to SCRIPT_SOURCE_URL: ${localError.message}`);
+    if (CONFIG.scriptSourceAuthToken) {
+      const authValue = CONFIG.scriptSourceAuthScheme
+        ? `${CONFIG.scriptSourceAuthScheme} ${CONFIG.scriptSourceAuthToken}`
+        : CONFIG.scriptSourceAuthToken;
+      headers[CONFIG.scriptSourceAuthHeader || "Authorization"] = authValue;
+    }
+
+    const response = await fetch(CONFIG.scriptSourceUrl, { headers });
+    if (!response.ok) {
+      throw new Error(`SCRIPT_SOURCE_URL fetch failed with ${response.status}`);
+    }
+    return rewriteScriptServerUrl(await response.text(), req);
   }
 
-  const headers = {};
-  if (CONFIG.scriptSourceUserAgent) {
-    headers["User-Agent"] = CONFIG.scriptSourceUserAgent;
+  const stat = await fs.stat(CONFIG.scriptSourcePath);
+  if (stat.mtimeMs !== scriptCache.mtimeMs) {
+    scriptCache = {
+      mtimeMs: stat.mtimeMs,
+      content: await fs.readFile(CONFIG.scriptSourcePath, "utf8")
+    };
   }
-  if (CONFIG.scriptSourceAccept) {
-    headers.Accept = CONFIG.scriptSourceAccept;
-  }
-  if (CONFIG.scriptSourceAuthToken) {
-    const authValue = CONFIG.scriptSourceAuthScheme
-      ? `${CONFIG.scriptSourceAuthScheme} ${CONFIG.scriptSourceAuthToken}`
-      : CONFIG.scriptSourceAuthToken;
-    headers[CONFIG.scriptSourceAuthHeader || "Authorization"] = authValue;
-  }
-
-  const response = await fetch(CONFIG.scriptSourceUrl, { headers });
-  if (!response.ok) {
-    throw new Error(`SCRIPT_SOURCE_URL fetch failed with ${response.status}`);
-  }
-  return rewriteScriptServerUrl(await response.text(), req);
+  return rewriteScriptServerUrl(scriptCache.content, req);
 }
 
 function rewriteScriptServerUrl(source, req) {
@@ -1548,6 +2325,50 @@ function resetDiscordClient() {
   discordClient = null;
 }
 
+async function withTimeout(promise, timeoutMs, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function registerDiscordCommands(commands) {
+  try {
+    console.log(
+      `Starting Discord slash command sync for ${commands.length} command(s) ` +
+      `(timeout ${CONFIG.discordCommandSyncTimeoutMs}ms)`
+    );
+    const rest = new REST({ version: "10" }).setToken(CONFIG.discordBotToken);
+    await withTimeout(
+      rest.put(
+        Routes.applicationCommands(CONFIG.discordApplicationId),
+        { body: commands.map((command) => ({ ...command.toJSON(), dm_permission: false })) }
+      ),
+      CONFIG.discordCommandSyncTimeoutMs,
+      "Discord slash command sync"
+    );
+    console.log(`Registered ${commands.length} Discord slash commands`);
+    if (CONFIG.discordAllowedUserIds.size > 0) {
+      console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
+    } else {
+      console.log("Discord slash command allowlist disabled; guild administrators are allowed.");
+    }
+  } catch (error) {
+    console.error("Discord slash command sync failed", error);
+  }
+}
+
 async function startDiscordBot() {
   if (!CONFIG.discordBotToken || !CONFIG.discordApplicationId) {
     console.log("Discord bot not configured; skipping bot startup");
@@ -1563,17 +2384,10 @@ async function startDiscordBot() {
     resetDiscordClient();
 
     const commands = createSlashCommands();
-    const rest = new REST({ version: "10" }).setToken(CONFIG.discordBotToken);
-    await rest.put(
-      Routes.applicationCommands(CONFIG.discordApplicationId),
-      { body: commands.map((command) => ({ ...command.toJSON(), dm_permission: false })) }
+    console.log(
+      `Starting Discord bot startup for application ${CONFIG.discordApplicationId} ` +
+      `with ${commands.length} command(s)`
     );
-    console.log(`Registered ${commands.length} Discord slash commands`);
-    if (CONFIG.discordAllowedUserIds.size > 0) {
-      console.log(`Discord slash command allowlist active: ${CONFIG.discordAllowedUserIds.size} user(s)`);
-    } else {
-      console.log("Discord slash command allowlist disabled; guild administrators are allowed.");
-    }
 
     const client = new Client({ intents: [GatewayIntentBits.Guilds] });
     discordClient = client;
@@ -1606,8 +2420,16 @@ async function startDiscordBot() {
       scheduleDiscordReconnect("session-invalidated", 5000);
     });
 
-    await client.login(CONFIG.discordBotToken);
+    console.log(`Starting Discord gateway login (timeout ${CONFIG.discordLoginTimeoutMs}ms)`);
+    await withTimeout(
+      client.login(CONFIG.discordBotToken),
+      CONFIG.discordLoginTimeoutMs,
+      "Discord gateway login"
+    );
+    console.log("Discord gateway login request completed");
+    void registerDiscordCommands(commands);
   } catch (error) {
+    resetDiscordClient();
     console.error("Discord bot startup failed", error);
     scheduleDiscordReconnect("startup-failed");
   } finally {
