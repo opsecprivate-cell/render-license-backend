@@ -265,7 +265,7 @@ async function handleAndroidHostApk(_req, res) {
 async function readAndroidHostUpdateMetadata() {
   try {
     const raw = await fs.readFile(ANDROID_UPDATE_METADATA_PATH, "utf8");
-    return JSON.parse(raw);
+    return JSON.parse(raw.replace(/^\uFEFF/, ""));
   } catch (_error) {
     return null;
   }
