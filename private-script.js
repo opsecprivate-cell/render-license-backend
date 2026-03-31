@@ -209,6 +209,16 @@
 
     function updateAuthGlobals() {
         window.__RENDER_AUTH_READY__ = !!STATE.authReady;
+        try {
+            window.__RENDER_AI_AUTH__ = STATE.authReady && STATE.sessionToken && STATE.requestSecret
+                ? {
+                    sessionToken: String(STATE.sessionToken || ""),
+                    requestSecret: String(STATE.requestSecret || ""),
+                    hwid: String(STATE.hwid || getHWID() || ""),
+                    isAdmin: !!STATE.isAdmin
+                }
+                : null;
+        } catch {}
     }
 
     function shouldForgetSavedKey(message) {
