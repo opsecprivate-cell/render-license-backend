@@ -160,6 +160,7 @@ app.post("/panel/api/users/message", asyncHandler(handlePanelMessageUser));
 app.get("/panel/api/service-actions", asyncHandler(handlePanelServiceActions));
 app.post("/panel/api/service/run", asyncHandler(handlePanelRunServiceAction));
 app.get("/bootstrap-script", asyncHandler(handleBootstrapScript));
+app.post("/bot-bridge/command", asyncHandler(handleBotBridgeCommand));
 
 app.post("/", asyncHandler(handleLicenseCheck));
 app.post("/script", asyncHandler(handleScriptFetch));
@@ -1070,6 +1071,102 @@ async function handlePanelRunServiceAction(req, res) {
   res.json({ success: true, result });
 }
 
+async function handleBotBridgeCommand(req, res) {
+  const access = getBotBridgeAccess(req);
+  if (!access.ok) {
+    res.status(access.status).json({ success: false, error: access.error });
+    return;
+  }
+
+  const command = String(req.body?.command || "").trim().toLowerCase();
+  if (!command) {
+    res.status(400).json({ success: false, error: "Missing command" });
+    return;
+  }
+
+  try {
+    let payload;
+    switch (command) {
+      case "stats":
+        payload = await buildBotBridgeStatsResponse();
+        break;
+      case "genkey":
+        payload = await buildBotBridgeGenerateResponse({
+          amount: req.body?.amount,
+          duration: req.body?.duration,
+          shared: req.body?.shared,
+          maxUses: req.body?.maxUses,
+          isAdmin: false
+        });
+        break;
+      case "genadminkey":
+        payload = await buildBotBridgeGenerateResponse({
+          amount: 1,
+          duration: req.body?.duration,
+          shared: false,
+          maxUses: 0,
+          isAdmin: true
+        });
+        break;
+      case "keys":
+        payload = await buildBotBridgeKeysResponse();
+        break;
+      case "keyinfo":
+        payload = await buildBotBridgeKeyInfoResponse(req.body?.key);
+        break;
+      case "deletekey":
+        payload = await buildBotBridgeDeleteKeyResponse(req.body?.key);
+        break;
+      case "deleteallkeys":
+        payload = await buildBotBridgeDeleteAllKeysResponse();
+        break;
+      case "compensate":
+      case "conpensate":
+        payload = await buildBotBridgeCompensateResponse(req.body?.key, req.body?.days);
+        break;
+      case "pause":
+        payload = await buildBotBridgePauseResponse(req.body?.key);
+        break;
+      case "resethwid":
+        payload = await buildBotBridgeResetHwidResponse(req.body?.key);
+        break;
+      case "blacklist":
+        payload = await buildBotBridgeBlacklistResponse(req.body?.key);
+        break;
+      case "jumpscare":
+        payload = await buildBotBridgeJumpscareResponse(req.body?.key);
+        break;
+      case "service":
+        payload = await buildBotBridgeServiceResponse(req.body?.action);
+        break;
+      case "health":
+        payload = {
+          message: "Render backend online",
+          data: {
+            service: "render-license-backend",
+            uptimeSeconds: Math.floor(process.uptime())
+          }
+        };
+        break;
+      default:
+        res.status(400).json({ success: false, error: `Unknown command: ${command}` });
+        return;
+    }
+
+    res.json({
+      success: true,
+      command,
+      message: payload.message,
+      data: payload.data || null
+    });
+  } catch (error) {
+    res.status(getPanelOperationStatus(error)).json({
+      success: false,
+      error: error?.message || "Bridge command failed"
+    });
+  }
+}
+
 function parseCookies(req) {
   const cookieHeader = String(req.headers?.cookie || "");
   const cookies = {};
@@ -1276,6 +1373,25 @@ function getPanelOperationStatus(error) {
   return 500;
 }
 
+function getBotBridgeAccess(req) {
+  const expected = String(CONFIG.discordBotToken || "").trim();
+  if (!expected) {
+    return { ok: false, status: 503, error: "Bridge auth is not configured" };
+  }
+
+  const header = String(req.headers?.authorization || "").trim();
+  if (!header.toLowerCase().startsWith("bearer ")) {
+    return { ok: false, status: 401, error: "Missing bearer token" };
+  }
+
+  const provided = header.slice(7).trim();
+  if (!provided || provided !== expected) {
+    return { ok: false, status: 403, error: "Invalid bridge token" };
+  }
+
+  return { ok: true };
+}
+
 async function runPanelOperation(res, operation) {
   try {
     return await operation();
@@ -1305,6 +1421,21 @@ async function buildStatsSnapshot() {
     adminKeys: Number(admins?.c || 0),
     liveSessions: Number(activeSessions?.c || 0),
     sharedActivations: Number(activations?.c || 0)
+  };
+}
+
+async function buildBotBridgeStatsResponse() {
+  const stats = await buildStatsSnapshot();
+  return {
+    message:
+      "Backend Stats" +
+      `\nTotal Keys: ${stats.totalKeys}` +
+      `\nSingle Keys: ${stats.singleKeys}` +
+      `\nShared Keys: ${stats.sharedKeys}` +
+      `\nAdmin Keys: ${stats.adminKeys}` +
+      `\nLive Sessions: ${stats.liveSessions}` +
+      `\nShared Activations: ${stats.sharedActivations}`,
+    data: stats
   };
 }
 
@@ -1426,6 +1557,20 @@ async function generateKeysForPanel({ amount, duration, shared, maxUses, isAdmin
   };
 }
 
+async function buildBotBridgeGenerateResponse(options) {
+  const generated = await generateKeysForPanel(options);
+  return {
+    message:
+      `Created ${generated.keys.length} key(s).` +
+      `\nDuration: ${generated.duration}` +
+      `\nExpires: ${formatExpiryForDiscord(generated.expiresAt)}` +
+      `\nType: ${generated.isAdmin ? "Admin Key" : (generated.shared ? "Shared Event Key" : "Single Device Key")}` +
+      `\nMax Uses: ${generated.shared ? (generated.maxUses > 0 ? `${generated.maxUses} unique HWIDs` : "Unlimited") : "1 HWID"}` +
+      `\nKeys:\n${generated.keys.join("\n")}`,
+    data: generated
+  };
+}
+
 async function buildPanelKeyInfo(rawKey) {
   const key = normalizeKey(rawKey);
   if (!key) {
@@ -1490,6 +1635,45 @@ async function buildPanelKeyInfo(rawKey) {
   };
 }
 
+async function buildBotBridgeKeysResponse() {
+  const recentKeys = await listRecentKeys(15);
+  if (recentKeys.length === 0) {
+    return {
+      message: "No keys found.",
+      data: { keys: [] }
+    };
+  }
+
+  const lines = recentKeys.map((row) => {
+    const status = row.blacklisted
+      ? "[BLACKLISTED]"
+      : (row.paused ? "[PAUSED]" : (row.shared ? "[SHARED]" : (row.hwid ? "[LOCKED]" : "[NEW]")));
+    const mode = row.shared ? (row.maxUses > 0 ? ` (shared, max ${row.maxUses})` : " (shared, unlimited)") : "";
+    return `${status} ${row.displayKey}${mode}`;
+  });
+
+  return {
+    message: `Recent Keys (${recentKeys.length} shown)\n${lines.join("\n")}`,
+    data: { keys: recentKeys }
+  };
+}
+
+async function buildBotBridgeKeyInfoResponse(rawKey) {
+  const info = await buildPanelKeyInfo(rawKey);
+  const message =
+    `Key: ${info.displayKey}` +
+    `\nType: ${info.isAdmin ? "Admin Key" : (info.shared ? "Shared Event Key" : "Single Device Key")}` +
+    `\nStatus: ${info.paused ? "Paused" : "Active"}${info.blacklisted ? " + Blacklisted" : ""}` +
+    `\nExpires: ${formatExpiryForDiscord(info.expiresAt)}` +
+    `\nLive Sessions: ${info.liveSessions}` +
+    `\nLast HWID: ${info.lastHwid || info.hwid || "N/A"}` +
+    `\nLast IP: ${maskIp(info.lastIp)}` +
+    `\nLast User: ${info.lastUsername || "Unknown"}` +
+    `\nLast Server: ${info.lastServer || "Unknown"}` +
+    `\nLast Seen: ${formatTimestamp(info.lastSeenAt)}`;
+  return { message, data: info };
+}
+
 async function compensateKeyForPanel(rawKey, daysInput) {
   const key = normalizeKey(rawKey);
   const days = Math.max(1, Math.min(3650, Number(daysInput) || 0));
@@ -1521,6 +1705,18 @@ async function compensateKeyForPanel(rawKey, daysInput) {
   };
 }
 
+async function buildBotBridgeCompensateResponse(rawKey, daysInput) {
+  const result = await compensateKeyForPanel(rawKey, daysInput);
+  return {
+    message:
+      `Compensated ${result.displayKey}` +
+      `\nAdded: ${result.daysAdded} day(s)` +
+      `\nOld Expiry: ${formatExpiryForDiscord(result.previousExpiry)}` +
+      `\nNew Expiry: ${formatExpiryForDiscord(result.nextExpiry)}`,
+    data: result
+  };
+}
+
 async function togglePauseKeyForPanel(rawKey) {
   const key = normalizeKey(rawKey);
   const data = await queryOne("SELECT paused FROM keys WHERE key_id = $1", [key]);
@@ -1533,6 +1729,14 @@ async function togglePauseKeyForPanel(rawKey) {
     keyId: key,
     displayKey: formatKeyForDisplay(key),
     paused
+  };
+}
+
+async function buildBotBridgePauseResponse(rawKey) {
+  const result = await togglePauseKeyForPanel(rawKey);
+  return {
+    message: `${result.paused ? "Paused" : "Resumed"} ${result.displayKey}.`,
+    data: result
   };
 }
 
@@ -1561,6 +1765,16 @@ async function resetKeyHwidForPanel(rawKey) {
   };
 }
 
+async function buildBotBridgeResetHwidResponse(rawKey) {
+  const result = await resetKeyHwidForPanel(rawKey);
+  return {
+    message: result.shared
+      ? `Reset shared usage slots for ${result.displayKey}.`
+      : `Reset HWID for ${result.displayKey}.`,
+    data: result
+  };
+}
+
 async function blacklistKeyForPanel(rawKey) {
   const key = normalizeKey(rawKey);
   const exists = await queryOne("SELECT 1 FROM keys WHERE key_id = $1", [key]);
@@ -1582,6 +1796,14 @@ async function blacklistKeyForPanel(rawKey) {
   };
 }
 
+async function buildBotBridgeBlacklistResponse(rawKey) {
+  const result = await blacklistKeyForPanel(rawKey);
+  return {
+    message: `Blacklisted ${result.displayKey}.`,
+    data: result
+  };
+}
+
 async function queueJumpscareForPanel(rawKey) {
   const key = normalizeKey(rawKey);
   const updated = await query("UPDATE keys SET jumpscare = TRUE WHERE key_id = $1", [key]);
@@ -1591,6 +1813,14 @@ async function queueJumpscareForPanel(rawKey) {
   return {
     keyId: key,
     displayKey: formatKeyForDisplay(key)
+  };
+}
+
+async function buildBotBridgeJumpscareResponse(rawKey) {
+  const result = await queueJumpscareForPanel(rawKey);
+  return {
+    message: `Queued a jumpscare for ${result.displayKey}.`,
+    data: result
   };
 }
 
@@ -1616,6 +1846,14 @@ async function deleteKeyForPanel(rawKey) {
   };
 }
 
+async function buildBotBridgeDeleteKeyResponse(rawKey) {
+  const result = await deleteKeyForPanel(rawKey);
+  return {
+    message: `Deleted ${result.displayKey} and related sessions.`,
+    data: result
+  };
+}
+
 async function deleteAllKeysForPanel() {
   await query("DELETE FROM sessions");
   await query("DELETE FROM presence");
@@ -1627,6 +1865,14 @@ async function deleteAllKeysForPanel() {
 
   return {
     deletedKeys: deletedKeys.rowCount
+  };
+}
+
+async function buildBotBridgeDeleteAllKeysResponse() {
+  const result = await deleteAllKeysForPanel();
+  return {
+    message: `Deleted ${result.deletedKeys} key(s) plus related sessions, activations, blacklist, presence, and chat data.`,
+    data: result
   };
 }
 
@@ -1744,6 +1990,38 @@ async function runServiceActionForPanel(rawAction) {
     stdout: result.stdout,
     stderr: result.stderr,
     success: result.code === 0
+  };
+}
+
+async function buildBotBridgeServiceResponse(rawAction) {
+  const action = normalizeServiceAction(rawAction);
+  if (!action) {
+    const actions = getConfiguredServiceActions();
+    return {
+      message: actions.length === 0
+        ? "No service actions configured."
+        : `Available Service Actions\nTarget: ${CONFIG.serviceSshHost}:${CONFIG.serviceSshPort}\nActions: ${actions.join(", ")}`,
+      data: {
+        enabled: CONFIG.serviceSshEnabled,
+        configured: isServiceSshConfigured(),
+        host: CONFIG.serviceSshHost,
+        port: CONFIG.serviceSshPort,
+        actions
+      }
+    };
+  }
+
+  const result = await runServiceActionForPanel(action);
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  return {
+    message:
+      `Service Action: ${result.action}` +
+      `\nTarget: ${result.target}` +
+      `\nExit Code: ${result.exitCode === null ? "N/A" : result.exitCode}` +
+      `\nDuration: ${result.durationMs}ms` +
+      `\nStatus: ${result.success ? "Success" : "Non-zero Exit"}` +
+      `\nOutput:\n${clipForCodeBlock(output)}`,
+    data: result
   };
 }
 
