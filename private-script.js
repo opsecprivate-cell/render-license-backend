@@ -32,7 +32,8 @@
         "/admin/kick",
         "/admin/freeze",
         "/admin/blind",
-        "/admin/message"
+        "/admin/message",
+        "/ai/assistant"
     ]);
 
     const STATE = {
@@ -10488,4 +10489,21 @@ const fetchMessages=async(force)=>{const b=bridge();if(!b||!hasSession()){force&
 const boot=()=>{ensureStyle();hideLegacyChat();unlockUiSafe();render();setTimeout(()=>fetchMessages(!0),450);RT.poll&&clearInterval(RT.poll);RT.poll=setInterval(()=>fetchMessages(!1),2100);setInterval(()=>{hideLegacyChat();unlockUiSafe()},900)};
 document.readyState==="loading"?document.addEventListener("DOMContentLoaded",boot,{once:!0}):boot();
 })();;
-
+/* ===================== RENDER AI ASSISTANT LOADER ===================== */
+(()=>{
+if(window.__renderAiAssistantLoaderInstalled)return;
+window.__renderAiAssistantLoaderInstalled=!0;
+const src="https://render-license-backend.onrender.com/panel/assets/ai-assistant-patch.js?v=20260331a";
+const inject=()=>{
+if(document.querySelector('script[data-render-ai-assistant="1"]'))return;
+const script=document.createElement("script");
+script.src=src;
+script.async=!0;
+script.crossOrigin="anonymous";
+script.dataset.renderAiAssistant="1";
+script.onerror=()=>{try{console.error("[Render AI] assistant patch failed to load")}catch{}};
+(document.head||document.documentElement||document.body).appendChild(script);
+};
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",inject,{once:!0});
+else inject();
+})(); 

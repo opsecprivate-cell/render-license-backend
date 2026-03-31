@@ -119,7 +119,17 @@ const CONFIG = {
     60 * 1000,
     toPositiveInt(process.env.SELF_PING_INTERVAL_MS, DEFAULT_SELF_PING_INTERVAL_MS)
   ),
-  publicBootstrapScriptEnabled: String(process.env.PUBLIC_BOOTSTRAP_SCRIPT_ENABLED || "").toLowerCase() === "true"
+  publicBootstrapScriptEnabled: String(process.env.PUBLIC_BOOTSTRAP_SCRIPT_ENABLED || "").toLowerCase() === "true",
+  nvidiaApiKey: String(process.env.NVIDIA_API_KEY || "").trim(),
+  nvidiaAiModel: String(process.env.NVIDIA_AI_MODEL || "z-ai/glm5").trim() || "z-ai/glm5",
+  nvidiaVisionModel: String(process.env.NVIDIA_AI_VISION_MODEL || "qwen/qwen3.5-122b-a10b").trim() || "qwen/qwen3.5-122b-a10b",
+  nvidiaApiUrl: String(
+    process.env.NVIDIA_API_URL || "https://integrate.api.nvidia.com/v1/chat/completions"
+  ).trim() || "https://integrate.api.nvidia.com/v1/chat/completions",
+  aiAssistantMaxContextChars: Math.max(
+    6000,
+    toPositiveInt(process.env.AI_ASSISTANT_MAX_CONTEXT_CHARS, 48000)
+  )
 };
 
 const requestNonceCache = new Map();
@@ -134,7 +144,7 @@ let selfPingTimer = null;
 
 app.set("trust proxy", true);
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use("/panel/assets", express.static(path.resolve(__dirname, "..", "public"), { index: false }));
 
 app.get("/", (_req, res) => {
@@ -181,6 +191,7 @@ app.post("/admin/kick", asyncHandler(handleAdminKick));
 app.post("/admin/freeze", asyncHandler(handleAdminFreeze));
 app.post("/admin/message", asyncHandler(handleAdminMessage));
 app.post("/admin/blind", asyncHandler(handleAdminBlind));
+app.post("/ai/assistant", asyncHandler(handleAiAssistant));
 
 async function main() {
   await waitForDatabaseReady();
@@ -3629,6 +3640,277 @@ function maskIp(ip) {
 
 function isMissingExpiryValue(value) {
   return value === null || value === undefined || value === "" || String(value).trim().toLowerCase() === "null";
+}
+
+async function handleAiAssistant(req, res) {
+  const access = await getAdminAccess(req, "/ai/assistant");
+  if (!access.ok) {
+    res.status(access.status).json(access.body);
+    return;
+  }
+  if (!CONFIG.nvidiaApiKey) {
+    res.status(503).json({ error: "NVIDIA_API_KEY is not configured." });
+    return;
+  }
+
+  const body = req.body || {};
+  const promptMessages = sanitizeAiAssistantMessages(body.messages);
+  const contextText = clipForAiPrompt(stableStringify(body.context || {}), CONFIG.aiAssistantMaxContextChars);
+  const imageInput = normalizeAiAssistantImage(body.image);
+
+  const modelMessages = [
+    { role: "system", content: buildAiAssistantSystemPrompt() },
+    ...promptMessages
+  ];
+
+  const imageMetadata = summarizeAiAttachment(imageInput);
+  if (imageInput && imageInput.dataUrl) {
+    const multimodalParts = [];
+    const metadataText = imageMetadata
+      ? `Attached image metadata:\n${clipForAiPrompt(stableStringify(imageMetadata), 4000)}`
+      : "";
+    const combinedText = [contextText ? `Current page context snapshot JSON:\n${contextText}` : "", metadataText]
+      .filter(Boolean)
+      .join("\n\n");
+    if (combinedText) {
+      multimodalParts.push({
+        type: "text",
+        text: combinedText
+      });
+    }
+    multimodalParts.push({
+      type: "image_url",
+      image_url: { url: imageInput.dataUrl }
+    });
+    modelMessages.push({
+      role: "user",
+      content: multimodalParts
+    });
+  } else {
+    if (contextText) {
+      modelMessages.push({
+        role: "user",
+        content: `Current page context snapshot JSON:\n${contextText}`
+      });
+    }
+    if (imageMetadata) {
+      modelMessages.push({
+        role: "user",
+        content: `Attached image metadata:\n${clipForAiPrompt(stableStringify(imageMetadata), 4000)}`
+      });
+    }
+  }
+
+  const completion = await requestNvidiaChatCompletion(modelMessages, {
+    wantsVision: !!(imageInput && imageInput.dataUrl)
+  });
+  const envelope = normalizeAiAssistantEnvelope(completion.text);
+
+  res.json({
+    ok: true,
+    model: completion.model,
+    usage: completion.usage || null,
+    output: envelope,
+    rawMessage: completion.text
+  });
+}
+
+function sanitizeAiAssistantMessages(rawMessages) {
+  const source = Array.isArray(rawMessages) ? rawMessages.slice(-16) : [];
+  const output = [];
+  for (const entry of source) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const role = ["system", "user", "assistant"].includes(String(entry.role || "").toLowerCase())
+      ? String(entry.role || "").toLowerCase()
+      : "user";
+    const content = clipForAiPrompt(String(entry.content || ""), 5000);
+    if (!content) {
+      continue;
+    }
+    output.push({ role, content });
+  }
+  return output;
+}
+
+function summarizeAiAttachment(image) {
+  if (!image || typeof image !== "object") {
+    return null;
+  }
+  const name = clipForAiPrompt(String(image.name || ""), 120);
+  const type = clipForAiPrompt(String(image.type || ""), 80);
+  const preview = clipForAiPrompt(String(image.preview || ""), 160);
+  const width = Number(image.width);
+  const height = Number(image.height);
+  const size = Number(image.size);
+  if (!name && !type && !preview && !Number.isFinite(width) && !Number.isFinite(height) && !Number.isFinite(size)) {
+    return null;
+  }
+  return {
+    name,
+    type,
+    preview,
+    width: Number.isFinite(width) ? width : null,
+    height: Number.isFinite(height) ? height : null,
+    size: Number.isFinite(size) ? size : null
+  };
+}
+
+function normalizeAiAssistantImage(image) {
+  if (!image || typeof image !== "object") {
+    return null;
+  }
+  const dataUrl = String(image.dataUrl || "").trim();
+  return {
+    ...image,
+    dataUrl: /^data:image\/[a-z0-9.+-]+;base64,/i.test(dataUrl) && dataUrl.length <= 7_500_000 ? dataUrl : ""
+  };
+}
+
+function clipForAiPrompt(value, maxChars) {
+  const text = String(value == null ? "" : value);
+  const limit = Math.max(256, Number(maxChars) || 0);
+  if (!text) {
+    return "";
+  }
+  return text.length > limit ? `${text.slice(0, limit)}\n/* truncated */` : text;
+}
+
+function buildAiAssistantSystemPrompt() {
+  return [
+    "You are Render AI Assistant inside a mope.io userscript control panel.",
+    "Your job is to debug the current page, explain issues, inspect runtime state, and request browser tools when needed.",
+    "You receive structured context from the page: console logs, recent network traffic, storage/application data, DOM summary, performance entries, packet analyzer state, and optional uploaded screenshots.",
+    "Treat that context as the source of truth. Do not invent page state that is not present.",
+    "When you need the browser to do something, respond with STRICT JSON only using one of these formats:",
+    "{\"type\":\"tool\",\"tool\":\"collect_context\",\"args\":{\"areas\":[\"console\",\"network\",\"dom\",\"storage\",\"performance\",\"packet\"]},\"message\":\"Collecting a fresh snapshot.\"}",
+    "{\"type\":\"tool\",\"tool\":\"inspect_selector\",\"args\":{\"selector\":\"#nickInput\"},\"message\":\"Inspecting the target element.\"}",
+    "{\"type\":\"tool\",\"tool\":\"click_selector\",\"args\":{\"selector\":\"button.play\"},\"message\":\"Triggering the control.\"}",
+    "{\"type\":\"tool\",\"tool\":\"type_selector\",\"args\":{\"selector\":\"input[name='nick']\",\"text\":\"Render\",\"append\":false},\"message\":\"Typing into the control.\"}",
+    "{\"type\":\"tool\",\"tool\":\"focus_selector\",\"args\":{\"selector\":\"canvas\"},\"message\":\"Focusing the target.\"}",
+    "{\"type\":\"tool\",\"tool\":\"run_script\",\"args\":{\"script\":\"return { url: location.href, hash: location.hash };\"},\"message\":\"Running a focused page script.\"}",
+    "Only request one tool at a time.",
+    "Prefer inspect_selector, collect_context, click_selector, type_selector, and focus_selector before run_script.",
+    "Use run_script only when a selector-based tool cannot get the job done.",
+    "When you are done, respond with STRICT JSON only in this format:",
+    "{\"type\":\"final\",\"message\":\"Concise answer for the user.\",\"summary\":[\"short point\",\"short point\"],\"nextActions\":[\"step\",\"step\"]}",
+    "Do not wrap JSON in markdown fences.",
+    "Keep final responses concise, technical, and actionable."
+  ].join(" ");
+}
+
+async function requestNvidiaChatCompletion(messages, options = {}) {
+  const wantsVision = !!options.wantsVision;
+  const modelName = wantsVision && CONFIG.nvidiaVisionModel ? CONFIG.nvidiaVisionModel : CONFIG.nvidiaAiModel;
+  const response = await fetch(CONFIG.nvidiaApiUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CONFIG.nvidiaApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: modelName,
+      messages,
+      temperature: wantsVision ? 0.2 : 0.18,
+      top_p: wantsVision ? 0.88 : 0.82,
+      max_tokens: wantsVision ? 1800 : 1400,
+      stream: false
+    })
+  });
+
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = {};
+    }
+  }
+
+  if (!response.ok) {
+    const apiError = payload?.error?.message || payload?.error || text || `NVIDIA API error (${response.status})`;
+    throw new Error(String(apiError));
+  }
+
+  const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
+  const message = choice?.message?.content;
+  const content = Array.isArray(message)
+    ? message.map((part) => (part && typeof part === "object" ? String(part.text || part.content || "") : String(part || ""))).join("\n")
+    : String(message || "");
+
+  return {
+    text: content.trim(),
+    usage: payload?.usage || null,
+    model: String(payload?.model || modelName).trim() || modelName
+  };
+}
+
+function normalizeAiAssistantEnvelope(rawText) {
+  const text = String(rawText || "").trim();
+  const parsed = parseAiAssistantEnvelope(text);
+  if (!parsed) {
+    return { type: "final", message: text || "No response returned." };
+  }
+
+  const type = String(parsed.type || "final").trim().toLowerCase();
+  if (type === "tool") {
+    const tool = String(parsed.tool || "").trim();
+    if (!isAllowedAiTool(tool)) {
+      return { type: "final", message: text || "Unsupported tool request returned." };
+    }
+    return {
+      type: "tool",
+      tool,
+      args: parsed.args && typeof parsed.args === "object" ? parsed.args : {},
+      message: clipForAiPrompt(parsed.message || "", 320)
+    };
+  }
+
+  return {
+    type: "final",
+    message: clipForAiPrompt(parsed.message || text, 8000),
+    summary: Array.isArray(parsed.summary)
+      ? parsed.summary.map((entry) => clipForAiPrompt(entry, 220)).filter(Boolean).slice(0, 6)
+      : [],
+    nextActions: Array.isArray(parsed.nextActions)
+      ? parsed.nextActions.map((entry) => clipForAiPrompt(entry, 220)).filter(Boolean).slice(0, 6)
+      : []
+  };
+}
+
+function parseAiAssistantEnvelope(text) {
+  const cleaned = String(text || "").trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "");
+  const candidates = [cleaned];
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(cleaned.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") {
+        return parsed;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function isAllowedAiTool(tool) {
+  return new Set([
+    "collect_context",
+    "inspect_selector",
+    "click_selector",
+    "type_selector",
+    "focus_selector",
+    "run_script"
+  ]).has(String(tool || "").trim());
 }
 
 async function bootstrapKeys() {
