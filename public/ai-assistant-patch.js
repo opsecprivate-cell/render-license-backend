@@ -1041,17 +1041,22 @@
 #renderMenu .rai-panel h3,#renderMenu .rai-feed-head h3,#renderMenu .rai-compose-head h3{margin:0;font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#dbefff}
 #renderMenu .rai-quick-grid,#renderMenu .rai-toggle-grid,#renderMenu .rai-feed{display:grid;gap:10px}
 #renderMenu .rai-quick-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-#renderMenu .rai-quick{padding:14px;border-radius:16px;border:1px solid rgba(125,188,255,.14);background:linear-gradient(180deg, rgba(18,31,49,.92), rgba(11,18,29,.97));cursor:pointer;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}
+#renderMenu button.rai-quick,#renderMenu button.rai-toggle,#renderMenu button.rai-button{appearance:none;-webkit-appearance:none;font:inherit;text-align:left;text-transform:none;letter-spacing:normal}
+#renderMenu .rai-quick{display:grid;align-content:start;gap:10px;min-height:154px;width:100%;padding:14px;border-radius:16px;border:1px solid rgba(125,188,255,.14);background:linear-gradient(180deg, rgba(18,31,49,.92), rgba(11,18,29,.97));cursor:pointer;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;box-sizing:border-box}
 #renderMenu .rai-quick:hover{transform:translateY(-2px);border-color:rgba(133,208,255,.32);box-shadow:0 12px 24px rgba(0,0,0,.18)}
-#renderMenu .rai-quick strong{display:block;font-size:12px;color:#f5fbff}
+#renderMenu .rai-quick strong{display:block;font-size:13px;line-height:1.25;color:#f5fbff;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
 #renderMenu .rai-quick span,#renderMenu .rai-toggle-copy span,#renderMenu .rai-feed-head span,#renderMenu .rai-compose-head span,#renderMenu .rai-empty,#renderMenu .rai-msg-meta,#renderMenu .rai-summary div,#renderMenu .rai-next div,#renderMenu .rai-attachment-copy span{font-size:11px;line-height:1.5;color:rgba(225,238,248,.7)}
-#renderMenu .rai-toggle{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:12px 14px;border-radius:16px;border:1px solid rgba(123,185,255,.14);background:rgba(10,18,30,.88);cursor:pointer}
-#renderMenu .rai-toggle-copy{display:grid;gap:4px}
-#renderMenu .rai-toggle-copy strong,#renderMenu .rai-msg-role,#renderMenu .rai-attachment-copy strong{font-size:12px;color:#f5fbff;font-weight:900}
+#renderMenu .rai-toggle{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;width:100%;min-height:94px;padding:14px 16px;border-radius:18px;border:1px solid rgba(123,185,255,.14);background:linear-gradient(180deg, rgba(14,24,38,.96), rgba(10,17,29,.98));cursor:pointer;box-sizing:border-box;transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease}
+#renderMenu .rai-toggle:hover{transform:translateY(-1px);border-color:rgba(144,214,255,.28);box-shadow:0 12px 26px rgba(0,0,0,.16)}
+#renderMenu .rai-toggle-copy{display:grid;gap:5px;min-width:0}
+#renderMenu .rai-toggle-copy strong,#renderMenu .rai-msg-role,#renderMenu .rai-attachment-copy strong{font-size:13px;line-height:1.2;color:#f5fbff;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+#renderMenu .rai-toggle-meta{display:grid;justify-items:end;gap:8px}
+#renderMenu .rai-toggle-state{display:inline-flex;align-items:center;justify-content:center;min-width:50px;height:24px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);color:rgba(234,245,255,.74);font-size:10px;font-weight:900;letter-spacing:.14em;text-transform:uppercase}
 #renderMenu .rai-switch{position:relative;width:48px;height:28px;border-radius:999px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.1);transition:background .18s ease,border-color .18s ease}
 #renderMenu .rai-switch::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:999px;background:#eef8ff;transition:transform .18s ease;box-shadow:0 6px 12px rgba(0,0,0,.2)}
 #renderMenu .rai-toggle.active .rai-switch{background:linear-gradient(90deg, rgba(60,164,255,.92), rgba(109,223,255,.96));border-color:rgba(145,224,255,.5)}
 #renderMenu .rai-toggle.active .rai-switch::after{transform:translateX(20px)}
+#renderMenu .rai-toggle.active .rai-toggle-state{background:rgba(92,196,255,.16);border-color:rgba(121,215,255,.28);color:#9ce5ff}
 #renderMenu .rai-feed-card{padding:16px;min-height:360px;display:grid;grid-template-rows:auto 1fr}
 #renderMenu .rai-feed-head,#renderMenu .rai-compose-head,#renderMenu .rai-msg-head{display:flex;justify-content:space-between;align-items:center;gap:10px}
 #renderMenu .rai-feed{min-height:220px;max-height:540px;overflow:auto;padding-right:2px}
@@ -1065,8 +1070,9 @@
 #renderMenu .rai-summary div,#renderMenu .rai-next div{padding-left:14px;position:relative}
 #renderMenu .rai-summary div::before,#renderMenu .rai-next div::before{content:"";position:absolute;left:0;top:.55em;width:6px;height:6px;border-radius:999px;background:#86dbff;box-shadow:0 0 12px rgba(134,219,255,.45)}
 #renderMenu .rai-composer{padding:16px;display:grid;gap:12px}
-#renderMenu .rai-composer textarea{width:100%;min-height:110px;resize:vertical;border-radius:18px;border:1px solid rgba(130,192,255,.14);background:rgba(8,14,24,.92);color:#f5fbff;padding:14px 15px;box-sizing:border-box;font:inherit;outline:none;transition:border-color .18s ease, box-shadow .18s ease}
+#renderMenu .rai-composer textarea{position:relative;z-index:2;width:100%;min-height:130px;resize:vertical;border-radius:18px;border:1px solid rgba(130,192,255,.14);background:rgba(8,14,24,.92);color:#f5fbff;padding:16px 17px;box-sizing:border-box;font:500 14px/1.55 'Segoe UI',system-ui,Arial,sans-serif;outline:none;transition:border-color .18s ease, box-shadow .18s ease;pointer-events:auto;user-select:text}
 #renderMenu .rai-composer textarea:focus{border-color:rgba(124,211,255,.38);box-shadow:0 0 0 3px rgba(98,197,255,.12)}
+#renderMenu .rai-composer textarea::placeholder{color:rgba(215,231,244,.42)}
 #renderMenu .rai-attachment{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;border:1px solid rgba(127,193,255,.16);background:linear-gradient(180deg, rgba(15,24,39,.94), rgba(10,16,26,.98))}
 #renderMenu .rai-attachment img{width:72px;height:72px;object-fit:cover;border-radius:12px;border:1px solid rgba(127,193,255,.18)}
 #renderMenu .rai-button{display:inline-flex;align-items:center;gap:8px;justify-content:center;min-height:42px;padding:0 16px;border:none;border-radius:14px;background:linear-gradient(135deg, rgba(62,169,255,.95), rgba(118,225,255,.92));color:#04121e;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;cursor:pointer;transition:transform .16s ease, box-shadow .16s ease, filter .16s ease}
@@ -1120,11 +1126,11 @@
           <div class="rai-panel">
             <h3>Control Surface</h3>
             <div class="rai-toggle-grid">
-              <button class="rai-toggle ${state.prefs.autoContext ? "active" : ""}" data-rai-toggle="autoContext"><div class="rai-toggle-copy"><strong>Auto Context</strong><span>Send fresh page context on every prompt.</span></div><span class="rai-switch"></span></button>
-              <button class="rai-toggle ${state.prefs.includeStorage ? "active" : ""}" data-rai-toggle="includeStorage"><div class="rai-toggle-copy"><strong>Application Data</strong><span>Include storage, cookies, caches, and IndexedDB names.</span></div><span class="rai-switch"></span></button>
-              <button class="rai-toggle ${state.prefs.includePackets ? "active" : ""}" data-rai-toggle="includePackets"><div class="rai-toggle-copy"><strong>Packet Analyzer</strong><span>Send recent packet analyzer state and decoded event summaries.</span></div><span class="rai-switch"></span></button>
-              <button class="rai-toggle ${state.prefs.includeSensitive ? "active" : ""}" data-rai-toggle="includeSensitive"><div class="rai-toggle-copy"><strong>Sensitive Values</strong><span>Allow fuller storage and input value previews.</span></div><span class="rai-switch"></span></button>
-              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit click, type, focus, and run-script tool actions.</span></div><span class="rai-switch"></span></button>
+              <button class="rai-toggle ${state.prefs.autoContext ? "active" : ""}" data-rai-toggle="autoContext" aria-pressed="${state.prefs.autoContext ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Auto Context</strong><span>Send fresh page context on every prompt.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.autoContext ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includeStorage ? "active" : ""}" data-rai-toggle="includeStorage" aria-pressed="${state.prefs.includeStorage ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Application Data</strong><span>Include storage, cookies, caches, and IndexedDB names.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeStorage ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includePackets ? "active" : ""}" data-rai-toggle="includePackets" aria-pressed="${state.prefs.includePackets ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Packet Analyzer</strong><span>Send recent packet analyzer state and decoded event summaries.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includePackets ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includeSensitive ? "active" : ""}" data-rai-toggle="includeSensitive" aria-pressed="${state.prefs.includeSensitive ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Sensitive Values</strong><span>Allow fuller storage and input value previews.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeSensitive ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation" aria-pressed="${state.prefs.allowAutomation ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit click, type, focus, and run-script tool actions.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.allowAutomation ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
             </div>
           </div>
         </section>
@@ -1135,7 +1141,7 @@
         <section class="rai-composer">
           <div class="rai-compose-head"><h3>Prompt + Tools</h3><span>${esc(state.attachment ? "image attached" : "text only")}</span></div>
           ${renderAttachmentMarkup()}
-          <textarea id="renderAiComposer" placeholder="Ask it to debug the page, inspect a selector, analyze recent errors, automate a click flow, or explain mope.io state."></textarea>
+          <textarea id="renderAiComposer" placeholder="Ask it to debug the page, inspect a selector, analyze recent errors, automate a click flow, or explain mope.io state." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
           <div class="rai-toolbar">
             <button class="rai-button rai-button-secondary" data-rai-action="snapshot">Collect Snapshot</button>
             <button class="rai-button rai-button-secondary" data-rai-action="clear">Clear Feed</button>
@@ -1149,10 +1155,35 @@
   };
   const bindUi = (menu) => {
     const composer = menu.querySelector("#renderAiComposer");
+    const stopUiPropagation = (event) => {
+      event.stopPropagation();
+    };
+    const armInteractiveNode = (node, keyboardOnly = false) => {
+      if (!node) {
+        return;
+      }
+      if (!keyboardOnly) {
+        ["pointerdown", "mousedown", "mouseup", "click", "dblclick"].forEach((type) => {
+          node.addEventListener(type, stopUiPropagation, true);
+        });
+      }
+      ["keydown", "keypress", "keyup", "input", "change", "focus"].forEach((type) => {
+        node.addEventListener(type, stopUiPropagation, true);
+      });
+    };
+    armInteractiveNode(composer);
+    if (composer) {
+      composer.readOnly = false;
+      composer.disabled = false;
+      composer.style.pointerEvents = "auto";
+      composer.style.userSelect = "text";
+    }
     menu.querySelectorAll("[data-rai-toggle]").forEach((node) => {
+      armInteractiveNode(node);
       node.addEventListener("click", () => togglePref(node.getAttribute("data-rai-toggle")));
     });
     menu.querySelectorAll("[data-rai-quick]").forEach((node) => {
+      armInteractiveNode(node);
       node.addEventListener("click", async () => {
         const mode = node.getAttribute("data-rai-quick");
         if (mode === "analyze") await quickPrompt("Analyze the current mope.io page state. Explain key issues, risks, and the best next debugging step.", defaultAreas());
@@ -1162,6 +1193,8 @@
       });
     });
     const fileInput = menu.querySelector("#renderAiFileInput");
+    armInteractiveNode(fileInput);
+    menu.querySelectorAll("[data-rai-action]").forEach((node) => armInteractiveNode(node));
     menu.querySelector("[data-rai-action='upload']")?.addEventListener("click", () => fileInput && fileInput.click());
     fileInput?.addEventListener("change", async (event) => {
       const file = event.target && event.target.files && event.target.files[0] ? event.target.files[0] : null;
