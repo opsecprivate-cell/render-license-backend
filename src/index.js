@@ -2111,6 +2111,52 @@ async function getAdminAccess(req, endpoint) {
   return session;
 }
 
+async function getAiAssistantAccess(req, endpoint) {
+  const body = req.body || {};
+  const sessionToken = String(body.sessionToken || "").trim();
+  const hwid = normalizeHwid(body.hwid);
+  const adminKeyAccess = body.adminKey ? await resolvePanelAdminKey(body.adminKey) : null;
+
+  if (sessionToken && hwid) {
+    const session = await getSessionForEndpoint(req, sessionToken, hwid, endpoint, body);
+    if (session.ok) {
+      const key = await queryOne("SELECT is_admin FROM keys WHERE key_id = $1", [session.session.key_id]);
+      if (key?.is_admin) {
+        return {
+          ok: true,
+          authMode: "session",
+          session: session.session,
+          keyId: session.session.key_id
+        };
+      }
+      if (!adminKeyAccess?.ok) {
+        return { ok: false, status: 403, body: { error: "Not admin" } };
+      }
+    } else if (!adminKeyAccess?.ok) {
+      return session;
+    }
+  }
+
+  if (adminKeyAccess?.ok) {
+    return {
+      ok: true,
+      authMode: "admin_key",
+      adminKey: adminKeyAccess.key,
+      keyId: adminKeyAccess.key.key_id
+    };
+  }
+
+  if (adminKeyAccess && !adminKeyAccess.ok) {
+    return {
+      ok: false,
+      status: adminKeyAccess.status,
+      body: { valid: false, error: adminKeyAccess.error }
+    };
+  }
+
+  return { ok: false, status: 401, body: { valid: false, error: "Invalid session" } };
+}
+
 async function getSessionForEndpoint(req, sessionToken, hwid, endpoint, body) {
   if (!sessionToken || !hwid) {
     return { ok: false, status: 401, body: { valid: false, error: "Invalid session" } };
@@ -3669,7 +3715,7 @@ function isMissingExpiryValue(value) {
 }
 
 async function handleAiAssistant(req, res) {
-  const access = await getAdminAccess(req, "/ai/assistant");
+  const access = await getAiAssistantAccess(req, "/ai/assistant");
   if (!access.ok) {
     res.status(access.status).json(access.body);
     return;

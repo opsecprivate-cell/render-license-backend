@@ -206,6 +206,16 @@
       ? { sessionToken, requestSecret, hwid }
       : null;
   };
+  const getStoredAdminKey = () => {
+    const liveAuth = window.__RENDER_AI_AUTH__;
+    const liveKey = String(liveAuth && liveAuth.licenseKey || "").trim();
+    if (liveKey) {
+      return liveKey;
+    }
+    const storedKey = String(readStorageJson(localStorage, "_mk_v2", "") || "").trim();
+    return storedKey || "";
+  };
+  const hasAssistantAccess = () => hasSession() || !!getStoredAdminKey();
   const createDirectSecurePayload = async (endpoint, payload, auth) => {
     const basePayload = payload && typeof payload === "object" ? { ...payload } : {};
     delete basePayload.__secureTs;
@@ -231,14 +241,21 @@
   };
   const directAssistantRequest = async (messages, context) => {
     const auth = getStoredAssistantAuth();
-    if (!auth) {
-      throw new Error("Active admin session required.");
+    const adminKey = getStoredAdminKey();
+    if (!auth && !adminKey) {
+      throw new Error("Active admin session or admin key required.");
     }
-    const payload = await createDirectSecurePayload("/ai/assistant", {
+    let payload = {
       messages,
       context,
       image: attachmentPayload()
-    }, auth);
+    };
+    if (auth) {
+      payload = await createDirectSecurePayload("/ai/assistant", payload, auth);
+    }
+    if (adminKey) {
+      payload.adminKey = adminKey;
+    }
     const response = await fetch(`${getBackendUrl()}/ai/assistant`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1050,8 +1067,8 @@
     if (!trimmedPrompt) {
       return;
     }
-    if (!hasSession()) {
-      notify("Join an active admin session first.", "warn");
+    if (!hasAssistantAccess()) {
+      notify("Join an active admin session or re-enter your admin key first.", "warn");
       return;
     }
     state.pending = true;
