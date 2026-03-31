@@ -30,6 +30,8 @@ const DEFAULT_DISCORD_COMMAND_SYNC_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_PANEL_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_SERVICE_SSH_TIMEOUT_MS = 20 * 1000;
+const ANDROID_ARTIFACTS_DIR = path.resolve(__dirname, "..", "android-artifacts");
+const ANDROID_UPDATE_METADATA_PATH = path.join(ANDROID_ARTIFACTS_DIR, "update.json");
 
 const CONFIG = {
   sessionTimeoutMs: toPositiveInt(process.env.SESSION_TIMEOUT_MS, 24 * 60 * 60 * 1000),
@@ -161,6 +163,8 @@ app.post("/panel/api/users/message", asyncHandler(handlePanelMessageUser));
 app.get("/panel/api/service-actions", asyncHandler(handlePanelServiceActions));
 app.post("/panel/api/service/run", asyncHandler(handlePanelRunServiceAction));
 app.get("/bootstrap-script", asyncHandler(handleBootstrapScript));
+app.get("/android-host/update.json", asyncHandler(handleAndroidHostUpdate));
+app.get("/android-host/latest.apk", asyncHandler(handleAndroidHostApk));
 app.post("/bot-bridge/command", asyncHandler(handleBotBridgeCommand));
 
 app.post("/", asyncHandler(handleLicenseCheck));
@@ -223,6 +227,60 @@ function asyncHandler(fn) {
       }
     }
   };
+}
+
+async function handleAndroidHostUpdate(req, res) {
+  const metadata = await readAndroidHostUpdateMetadata();
+  if (!metadata) {
+    res.status(404).json({ error: "Android host update metadata is missing." });
+    return;
+  }
+  const apkPath = resolveAndroidHostApkPath(metadata);
+  const stat = await fs.stat(apkPath);
+  const externalUrl = buildExternalUrl(req);
+  res.json({
+    versionCode: Number(metadata.versionCode || 0),
+    versionName: String(metadata.versionName || "").trim(),
+    fileName: path.basename(apkPath),
+    fileSize: Number(metadata.fileSize || stat.size || 0),
+    notes: String(metadata.notes || "").trim(),
+    publishedAt: String(metadata.publishedAt || "").trim(),
+    apkUrl: String(metadata.apkUrl || `${externalUrl}/android-host/latest.apk`).trim()
+  });
+}
+
+async function handleAndroidHostApk(_req, res) {
+  const metadata = await readAndroidHostUpdateMetadata();
+  if (!metadata) {
+    res.status(404).json({ error: "Android host update metadata is missing." });
+    return;
+  }
+  const apkPath = resolveAndroidHostApkPath(metadata);
+  await fs.access(apkPath);
+  res.setHeader("Content-Type", "application/vnd.android.package-archive");
+  res.setHeader("Content-Disposition", `attachment; filename="${path.basename(apkPath)}"`);
+  res.sendFile(apkPath);
+}
+
+async function readAndroidHostUpdateMetadata() {
+  try {
+    const raw = await fs.readFile(ANDROID_UPDATE_METADATA_PATH, "utf8");
+    return JSON.parse(raw);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function resolveAndroidHostApkPath(metadata) {
+  const fileName = path.basename(String(metadata?.fileName || "Flow-Bot-Host-debug.apk").trim() || "Flow-Bot-Host-debug.apk");
+  return path.join(ANDROID_ARTIFACTS_DIR, fileName);
+}
+
+function buildExternalUrl(req) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").trim();
+  const protocol = forwardedProto || req.protocol || "https";
+  const host = String(req.headers.host || "").trim();
+  return host ? `${protocol}://${host}` : "https://render-license-backend.onrender.com";
 }
 
 async function handleLicenseCheck(req, res) {
