@@ -149,6 +149,106 @@
     window.__RENDER_SECURE && typeof window.__RENDER_SECURE.callApi === "function"
       ? window.__RENDER_SECURE
       : null;
+  const readStorageJson = (storage, key, fallbackValue = "") => {
+    try {
+      const raw = storage && typeof storage.getItem === "function" ? storage.getItem(key) : null;
+      return raw == null ? fallbackValue : JSON.parse(raw);
+    } catch {
+      return fallbackValue;
+    }
+  };
+  const getBackendUrl = () => {
+    const configured = String(window.__RENDER_LIGHT_LOADER_BACKEND__ || "").trim();
+    return configured || "https://render-license-backend.onrender.com";
+  };
+  const canonicalizeSecurePayload = (value) => {
+    if (value === null || value === undefined) {
+      return "null";
+    }
+    if (typeof value !== "object") {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => canonicalizeSecurePayload(entry)).join(",")}]`;
+    }
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalizeSecurePayload(value[key])}`).join(",")}}`;
+  };
+  const toHex = (bytes) => Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  const hmacSha256Hex = async (secret, message) => {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(String(secret || "")),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(String(message || "")));
+    return toHex(new Uint8Array(signature));
+  };
+  const getStoredAssistantAuth = () => {
+    const sessionToken = String(readStorageJson(sessionStorage, "_st_v2", "") || "").trim();
+    const requestSecret = String(readStorageJson(sessionStorage, "_rs_v2", "") || "").trim();
+    const storedHwid = String(readStorageJson(localStorage, "_hw_v2", "") || "").trim().toUpperCase();
+    const hwid = /^[A-F0-9]{16}$/.test(storedHwid)
+      ? storedHwid
+      : (bridge() && typeof bridge().getHwid === "function" ? String(bridge().getHwid() || "").trim().toUpperCase() : "");
+    return sessionToken && requestSecret && /^[A-F0-9]{16}$/.test(hwid)
+      ? { sessionToken, requestSecret, hwid }
+      : null;
+  };
+  const createDirectSecurePayload = async (endpoint, payload, auth) => {
+    const basePayload = payload && typeof payload === "object" ? { ...payload } : {};
+    delete basePayload.__secureTs;
+    delete basePayload.__secureNonce;
+    delete basePayload.__secureSig;
+    delete basePayload.sessionToken;
+    delete basePayload.hwid;
+    const nonceBytes = new Uint8Array(16);
+    crypto.getRandomValues(nonceBytes);
+    const ts = Date.now();
+    const nonce = `${Date.now().toString(36)}.${toHex(nonceBytes)}`;
+    const canonicalPayload = canonicalizeSecurePayload(basePayload);
+    const base = `${endpoint}|${auth.sessionToken}|${auth.hwid}|${ts}|${nonce}|${canonicalPayload}`;
+    const sig = await hmacSha256Hex(auth.requestSecret, base);
+    return {
+      ...basePayload,
+      sessionToken: auth.sessionToken,
+      hwid: auth.hwid,
+      __secureTs: ts,
+      __secureNonce: nonce,
+      __secureSig: sig
+    };
+  };
+  const directAssistantRequest = async (messages, context) => {
+    const auth = getStoredAssistantAuth();
+    if (!auth) {
+      throw new Error("Active admin session required.");
+    }
+    const payload = await createDirectSecurePayload("/ai/assistant", {
+      messages,
+      context,
+      image: attachmentPayload()
+    }, auth);
+    const response = await fetch(`${getBackendUrl()}/ai/assistant`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const responseText = await response.text();
+    let json = {};
+    if (responseText) {
+      try {
+        json = JSON.parse(responseText);
+      } catch {
+        json = {};
+      }
+    }
+    if (!response.ok) {
+      throw new Error(json && json.error ? json.error : responseText || `Assistant request failed (${response.status})`);
+    }
+    return json;
+  };
   const hasSession = () => {
     const api = bridge();
     return !!(api && typeof api.hasSession === "function" && api.hasSession());
@@ -882,14 +982,24 @@
   };
   const callAssistant = async (messages, context) => {
     const api = bridge();
-    if (!api || !hasSession()) {
-      throw new Error("Active admin session required.");
+    let response = null;
+    if (api && hasSession()) {
+      try {
+        response = await api.callApi("/ai/assistant", {
+          messages,
+          context,
+          image: attachmentPayload()
+        });
+      } catch (error) {
+        const message = formatError(error);
+        if (!/blocked endpoint|secure bridge unavailable/i.test(message)) {
+          throw error;
+        }
+      }
     }
-    const response = await api.callApi("/ai/assistant", {
-      messages,
-      context,
-      image: attachmentPayload()
-    });
+    if (!response) {
+      response = await directAssistantRequest(messages, context);
+    }
     if (!response || response.ok !== true) {
       throw new Error(response && response.error ? response.error : "Assistant request failed.");
     }
