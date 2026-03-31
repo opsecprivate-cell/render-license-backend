@@ -54,6 +54,7 @@ const CONFIG = {
   bootstrapAdminExpires: parseExpiryMs(process.env.BOOTSTRAP_ADMIN_EXPIRES || null),
   bootstrapTestExpires: parseExpiryMs(process.env.BOOTSTRAP_TEST_EXPIRES || null),
   discordBotToken: String(process.env.DISCORD_BOT_TOKEN || "").trim(),
+  discordBridgeToken: String(process.env.DISCORD_BRIDGE_TOKEN || process.env.DISCORD_BOT_TOKEN || "").trim(),
   discordApplicationId: String(process.env.DISCORD_APPLICATION_ID || "").trim(),
   discordAllowedUserIds: parseDiscordIdAllowlist(
     process.env.DISCORD_ALLOWED_USER_IDS,
@@ -1374,7 +1375,7 @@ function getPanelOperationStatus(error) {
 }
 
 function getBotBridgeAccess(req) {
-  const expected = String(CONFIG.discordBotToken || "").trim();
+  const expected = String(CONFIG.discordBridgeToken || "").trim();
   if (!expected) {
     return { ok: false, status: 503, error: "Bridge auth is not configured" };
   }
