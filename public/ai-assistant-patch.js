@@ -4,7 +4,7 @@
   }
   window.__renderAiAssistantPatchLoaded = true;
 
-  const VERSION = "20260331.2";
+  const VERSION = "20260331.3";
   const TAB_ID = "ai";
   const TAB_HTML = `
     <i class="bx bx-bot"></i>
@@ -20,6 +20,37 @@
   const MAX_NETWORK = 120;
   const MAX_PACKET_RECORDS = 28;
   const MAX_IMAGE_BYTES = 4_800_000;
+  const SOURCE_FIELD_KEYS = new Set([
+    "source",
+    "script",
+    "code",
+    "botCode",
+    "customPvpCode",
+    "customAntiBotCode"
+  ]);
+  const CODE_SLOT_DEFS = Object.freeze({
+    pvp: {
+      id: "pvp",
+      aliases: ["pvp", "pvpbot", "pvp_bot", "custompvpcode"],
+      modKey: "customPvpCode",
+      applyMethod: "applyCustomAttackCode",
+      label: "PVP Bot"
+    },
+    antiBot: {
+      id: "antiBot",
+      aliases: ["antibot", "anti-bot", "anti_bot", "customantibotcode"],
+      modKey: "customAntiBotCode",
+      applyMethod: "applyCustomAntiBotCode",
+      label: "Anti-Bot"
+    },
+    bot: {
+      id: "bot",
+      aliases: ["bot", "mainbot", "main_bot", "botcode"],
+      modKey: "botCode",
+      applyMethod: "",
+      label: "Main Bot"
+    }
+  });
   const DEFAULT_PREFS = {
     autoContext: true,
     includeStorage: true,
@@ -55,6 +86,44 @@
   const clip = (value, max = 1600) => {
     const stringValue = String(value == null ? "" : value);
     return stringValue.length > max ? `${stringValue.slice(0, max)}\n/* clipped */` : stringValue;
+  };
+  const fastHash = (value) => {
+    const input = String(value == null ? "" : value);
+    let hash = 2166136261;
+    for (let index = 0; index < input.length; index += 1) {
+      hash ^= input.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv1a:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  };
+  const countLines = (value) => {
+    const input = String(value == null ? "" : value);
+    return input ? input.split(/\r\n|\r|\n/).length : 0;
+  };
+  const looksLikeSource = (value) => {
+    const input = String(value == null ? "" : value);
+    if (input.length < 120) {
+      return false;
+    }
+    let score = 0;
+    if (/\bfunction\b/.test(input)) score += 2;
+    if (/=>/.test(input)) score += 2;
+    if (/\breturn\b/.test(input)) score += 1;
+    if (/\b(const|let|var|class|async|await)\b/.test(input)) score += 2;
+    if (/[{};]/.test(input)) score += 1;
+    if (/\b(window|document|Math|Array|Object)\./.test(input)) score += 1;
+    if (/\n/.test(input)) score += 1;
+    return score >= 4;
+  };
+  const summarizeCodeBlob = (value, kind = "source") => {
+    const input = String(value == null ? "" : value);
+    return {
+      redacted: true,
+      kind,
+      chars: input.length,
+      lines: countLines(input),
+      hash: fastHash(input)
+    };
   };
   const stable = (value, max = 3200) => {
     try {
@@ -429,6 +498,42 @@
     }
     return out;
   };
+  const sanitizeToolPayload = (value, path = "", depth = 0) => {
+    const leafKey = path ? path.split(".").pop() : "";
+    if (value == null || typeof value === "number" || typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "function") {
+      return `[Function ${value.name || "anonymous"}]`;
+    }
+    if (typeof value === "string") {
+      if (SOURCE_FIELD_KEYS.has(String(leafKey || "").trim()) || looksLikeSource(value)) {
+        return summarizeCodeBlob(value, SOURCE_FIELD_KEYS.has(String(leafKey || "").trim()) ? "protected-source" : "code-like-string");
+      }
+      return clip(value, 2000);
+    }
+    if (depth > 5) {
+      return "[depth]";
+    }
+    if (Array.isArray(value)) {
+      return value.slice(0, 40).map((item, index) => sanitizeToolPayload(item, `${path}[${index}]`, depth + 1));
+    }
+    if (value && value.nodeType === 1) {
+      return summarizeElement(value, state.prefs.includeSensitive);
+    }
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        stack: clip(value.stack || "", 1200)
+      };
+    }
+    const output = {};
+    for (const [key, item] of Object.entries(value).slice(0, 40)) {
+      output[key] = sanitizeToolPayload(item, path ? `${path}.${key}` : key, depth + 1);
+    }
+    return output;
+  };
   const recordConsole = (level, args) => {
     pushLimited(
       state.consoleEntries,
@@ -727,6 +832,391 @@
       recent: records
     };
   };
+  const isCodeSlotField = (key) =>
+    Object.values(CODE_SLOT_DEFS).some((entry) => entry.modKey === String(key || ""));
+  const getCodeSlotDef = (slotName) => {
+    const normalized = String(slotName || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (!normalized) {
+      return null;
+    }
+    return Object.values(CODE_SLOT_DEFS).find((entry) =>
+      entry.aliases.some((alias) => alias.replace(/[^a-z0-9]+/g, "") === normalized)
+    ) || null;
+  };
+  const getCodeSlotValue = (slotName) => {
+    const def = getCodeSlotDef(slotName);
+    if (!def || !window.mod) {
+      return "";
+    }
+    return String(window.mod[def.modKey] || "");
+  };
+  const summarizeCodeSlot = (slotName) => {
+    const def = getCodeSlotDef(slotName);
+    if (!def) {
+      return null;
+    }
+    const code = getCodeSlotValue(def.id);
+    const present = !!code.trim();
+    return {
+      id: def.id,
+      label: def.label,
+      modKey: def.modKey,
+      present,
+      chars: code.length,
+      lines: countLines(code),
+      hash: present ? fastHash(code) : "",
+      liveApply: !!def.applyMethod
+    };
+  };
+  const summarizePrimitiveSetting = (value) => {
+    if (typeof value === "string") {
+      return text(value, 180);
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value === "boolean") {
+      return value;
+    }
+    return value == null ? null : text(String(value), 180);
+  };
+  const summarizeModValue = (value, key = "", depth = 0) => {
+    if (isCodeSlotField(key)) {
+      return summarizeCodeSlot(key);
+    }
+    if (value == null || typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
+      return summarizePrimitiveSetting(value);
+    }
+    if (depth > 2) {
+      return "[depth]";
+    }
+    if (Array.isArray(value)) {
+      return {
+        type: "array",
+        length: value.length,
+        sample: value.slice(0, 8).map((item) => summarizeModValue(item, "", depth + 1))
+      };
+    }
+    if (typeof value === "function") {
+      return `[Function ${value.name || "anonymous"}]`;
+    }
+    const output = {};
+    for (const [childKey, childValue] of Object.entries(value).slice(0, 30)) {
+      output[childKey] = summarizeModValue(childValue, childKey, depth + 1);
+    }
+    return output;
+  };
+  const summarizeModSettings = () => {
+    if (!window.mod || typeof window.mod !== "object") {
+      return null;
+    }
+    const output = {};
+    for (const key of Object.keys(window.mod).sort()) {
+      output[key] = summarizeModValue(window.mod[key], key, 0);
+    }
+    return output;
+  };
+  const parseModPath = (path) =>
+    String(path || "")
+      .split(".")
+      .map((part) => part.trim())
+      .filter(Boolean);
+  const getModSetting = (path) => {
+    if (!window.mod || typeof window.mod !== "object") {
+      return { ok: false, error: "window.mod is unavailable." };
+    }
+    const parts = parseModPath(path);
+    if (!parts.length) {
+      return { ok: false, error: "A mod setting path is required." };
+    }
+    let cursor = window.mod;
+    for (let index = 0; index < parts.length; index += 1) {
+      const key = parts[index];
+      if (!cursor || typeof cursor !== "object" || !(key in cursor)) {
+        return { ok: false, error: `Setting path not found: ${parts.join(".")}` };
+      }
+      cursor = cursor[key];
+    }
+    return {
+      ok: true,
+      path: parts.join("."),
+      value: sanitizeToolPayload(summarizeModValue(cursor, parts[parts.length - 1], 0), parts.join("."))
+    };
+  };
+  const syncRuntimeAfterModChange = () => {
+    try {
+      if (window.menu && typeof window.menu.saveSettings === "function") {
+        window.menu.saveSettings();
+      }
+    } catch {}
+    try {
+      if (window.menu && typeof window.menu.applyPerformanceMode === "function") {
+        window.menu.applyPerformanceMode();
+      }
+    } catch {}
+    try {
+      if (window.menu && typeof window.menu.renderTabContent === "function" && window.menu.currentTab) {
+        window.menu.renderTabContent();
+      }
+    } catch {}
+  };
+  const setModSetting = (path, value) => {
+    if (!window.mod || typeof window.mod !== "object") {
+      return { ok: false, error: "window.mod is unavailable." };
+    }
+    const parts = parseModPath(path);
+    if (!parts.length) {
+      return { ok: false, error: "A mod setting path is required." };
+    }
+    if (isCodeSlotField(parts[parts.length - 1])) {
+      return { ok: false, error: "Use set_code_slot for code fields." };
+    }
+    let cursor = window.mod;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      const key = parts[index];
+      if (!cursor[key] || typeof cursor[key] !== "object") {
+        cursor[key] = {};
+      }
+      cursor = cursor[key];
+    }
+    cursor[parts[parts.length - 1]] = value;
+    syncRuntimeAfterModChange();
+    return {
+      ok: true,
+      path: parts.join("."),
+      value: sanitizeToolPayload(summarizeModValue(cursor[parts[parts.length - 1]], parts[parts.length - 1], 0), parts.join("."))
+    };
+  };
+  const setModSettings = (updates) => {
+    const entries = Array.isArray(updates)
+      ? updates
+      : updates && typeof updates === "object"
+        ? Object.entries(updates).map(([path, value]) => ({ path, value }))
+        : [];
+    if (!entries.length) {
+      return { ok: false, error: "No mod settings were provided." };
+    }
+    const results = [];
+    for (const entry of entries.slice(0, 24)) {
+      const result = setModSetting(entry && entry.path, entry && entry.value);
+      results.push({
+        path: String(entry && entry.path || ""),
+        ok: !!result.ok,
+        value: result.value || null,
+        error: result.error || ""
+      });
+    }
+    return {
+      ok: results.some((item) => item.ok),
+      results
+    };
+  };
+  const listModSettings = () => ({
+    ok: !!window.mod,
+    count: window.mod && typeof window.mod === "object" ? Object.keys(window.mod).length : 0,
+    settings: sanitizeToolPayload(summarizeModSettings(), "mod")
+  });
+  const applyCodeSlot = (slotName, code) => {
+    const def = getCodeSlotDef(slotName);
+    if (!def) {
+      return { ok: false, error: `Unknown code slot: ${slotName}` };
+    }
+    if (!window.mod || typeof window.mod !== "object") {
+      return { ok: false, error: "window.mod is unavailable." };
+    }
+    const nextCode = String(code == null ? "" : code);
+    window.mod[def.modKey] = nextCode;
+    try {
+      if (def.applyMethod && window.fighter && typeof window.fighter[def.applyMethod] === "function") {
+        const applyResult = window.fighter[def.applyMethod](nextCode);
+        if (!applyResult || applyResult.ok !== true) {
+          throw applyResult && applyResult.error ? applyResult.error : new Error("Live apply failed.");
+        }
+        syncRuntimeAfterModChange();
+        return {
+          ok: true,
+          slot: def.id,
+          liveApplied: true,
+          cleared: !!applyResult.cleared,
+          version: applyResult.version || null,
+          summary: summarizeCodeSlot(def.id)
+        };
+      }
+      syncRuntimeAfterModChange();
+      return {
+        ok: true,
+        slot: def.id,
+        liveApplied: false,
+        note: "Slot updated in runtime; no dedicated live compiler is exposed for this slot.",
+        summary: summarizeCodeSlot(def.id)
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        slot: def.id,
+        error: formatError(error),
+        summary: summarizeCodeSlot(def.id)
+      };
+    }
+  };
+  const getDumpRegistry = () =>
+    window.__renderFunctionDumpRegistry && typeof window.__renderFunctionDumpRegistry === "object"
+      ? window.__renderFunctionDumpRegistry
+      : {};
+  const analyzeDumpSource = (source) => {
+    const input = String(source || "");
+    return {
+      available: !!input,
+      native: /\[native code\]/i.test(input),
+      chars: input.length,
+      lines: countLines(input),
+      hash: input ? fastHash(input) : "",
+      capabilities: {
+        network: /\b(fetch|XMLHttpRequest|WebSocket)\b/.test(input),
+        packetIO: /\b(writeUInt|readUInt|packet|reader|writer)\b/i.test(input),
+        socket: /\bsocket\b/i.test(input),
+        render: /\b(drawImage|fillText|stroke|canvas|ctx)\b/i.test(input),
+        dom: /\b(querySelector|createElement|appendChild|document\.)\b/.test(input),
+        session: /\b(session|reconnect|handshake)\b/i.test(input),
+        movement: /\b(move|mouse|keydown|keyup|canvas)\b/i.test(input)
+      }
+    };
+  };
+  const summarizeDumpTarget = (target) => {
+    if (!target || typeof target !== "object") {
+      return null;
+    }
+    const meta = target.meta && typeof target.meta === "object" ? target.meta : {};
+    return {
+      name: text(target.name || "", 120),
+      alias: text(meta.alias || "", 120),
+      type: text(target.type || typeof target.value || "", 48),
+      arity: typeof target.value === "function" ? target.value.length : null,
+      group: text(meta.group || "", 48),
+      role: text(meta.role || "", 160),
+      opcode: Number.isFinite(meta.opcode) ? meta.opcode : null,
+      updatedAt: meta.updatedAt || null,
+      notes: text(meta.note || "", 220),
+      paramAliases: sanitizeToolPayload(meta.paramAliases || {}, "dump.paramAliases"),
+      sourceMeta: analyzeDumpSource(target.source)
+    };
+  };
+  const listDumpTargets = (query) => {
+    const registry = getDumpRegistry();
+    const needle = text(query || "", 80).toLowerCase();
+    const targets = Object.values(registry)
+      .filter((entry) => entry && typeof entry === "object")
+      .filter((entry) => {
+        if (!needle) {
+          return true;
+        }
+        const haystack = [
+          entry.name,
+          entry.meta && entry.meta.alias,
+          entry.meta && entry.meta.group,
+          entry.meta && entry.meta.role
+        ].map((value) => String(value || "").toLowerCase()).join(" ");
+        return haystack.includes(needle);
+      })
+      .slice(0, 80)
+      .map((entry) => summarizeDumpTarget(entry));
+    return {
+      ok: true,
+      total: Object.keys(registry).length,
+      matches: targets.length,
+      targets
+    };
+  };
+  const inspectDumpTarget = (name) => {
+    const registry = getDumpRegistry();
+    const needle = String(name || "").trim().toLowerCase();
+    if (!needle) {
+      return { ok: false, error: "A dump target name or alias is required." };
+    }
+    const match = Object.values(registry).find((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return false;
+      }
+      const meta = entry.meta && typeof entry.meta === "object" ? entry.meta : {};
+      return String(entry.name || "").toLowerCase() === needle || String(meta.alias || "").toLowerCase() === needle;
+    });
+    if (!match) {
+      return { ok: false, error: `Dump target not found: ${name}` };
+    }
+    return {
+      ok: true,
+      target: summarizeDumpTarget(match)
+    };
+  };
+  const summarizeEntity = (entity) => {
+    if (!entity || typeof entity !== "object") {
+      return null;
+    }
+    return {
+      id: entity.id != null ? entity.id : null,
+      x: Number(entity.nx != null ? entity.nx : entity.x) || 0,
+      y: Number(entity.ny != null ? entity.ny : entity.y) || 0,
+      radius: Number(entity.nRad != null ? entity.nRad : entity.rad) || 0,
+      animalType: entity.animalType != null ? entity.animalType : null,
+      species: entity.animalSpecies != null ? entity.animalSpecies : null,
+      subSpecies: entity.animalSubSpecies != null ? entity.animalSubSpecies : null,
+      nickName: text(entity.nickName || entity.name || "", 80)
+    };
+  };
+  const summarizeGameRef = () => {
+    const ref = window._gameRef && typeof window._gameRef === "object" ? window._gameRef : null;
+    return ref
+      ? {
+          player: summarizeEntity(ref.player),
+          enemy: summarizeEntity(ref.enemy),
+          playersCount: Array.isArray(ref.players) ? ref.players.length : null,
+          helpers: {
+            send: typeof ref.send === "function",
+            sender: typeof ref.sender === "function",
+            getDist: typeof ref.getDist === "function",
+            getDir: typeof ref.getDir === "function"
+          }
+        }
+      : null;
+  };
+  const summarizePvpRuntime = () => {
+    const bot = window.pvpBot && typeof window.pvpBot === "object" ? window.pvpBot : null;
+    const fighter = window.fighter && typeof window.fighter === "object" ? window.fighter : null;
+    return {
+      pvpBot: bot
+        ? {
+            inFight: !!bot.inFight,
+            status: text(bot.status || "", 80),
+            customIndicatorText: text(bot.customIndicatorText || "", 80),
+            predictedPos: bot.predictedPos
+              ? {
+                  x: Number(bot.predictedPos.nx != null ? bot.predictedPos.nx : bot.predictedPos.x) || 0,
+                  y: Number(bot.predictedPos.ny != null ? bot.predictedPos.ny : bot.predictedPos.y) || 0
+                }
+              : null,
+            moveToPos: bot.moveToPos
+              ? {
+                  x: Number(bot.moveToPos.x != null ? bot.moveToPos.x : bot.moveToPos.nx) || 0,
+                  y: Number(bot.moveToPos.y != null ? bot.moveToPos.y : bot.moveToPos.ny) || 0
+                }
+              : null,
+            antiBot: bot.antiBot
+              ? {
+                  enabled: !!window.mod?.antiBot,
+                  label: text(bot.antiBot.label || "", 80)
+                }
+              : null
+          }
+        : null,
+      fighter: fighter
+        ? {
+            customAttackLoaded: typeof fighter._customAttackFn === "function",
+            customAntiBotLoaded: typeof fighter._customAntiBotFn === "function",
+            marks: Array.isArray(fighter.marks) ? fighter.marks.length : null
+          }
+        : null
+    };
+  };
   const collectMopeSnapshot = () => {
     const canvas = document.querySelector("canvas");
     const playerPos = window.modPlayerPos && typeof window.modPlayerPos === "object"
@@ -750,17 +1240,13 @@
             clientHeight: canvas.clientHeight
           }
         : null,
-      mod: window.mod
-        ? {
-            pvpbot: !!window.mod.pvpbot,
-            farmer: !!window.mod.farmer,
-            antiBot: !!window.mod.antiBot,
-            antiLag: !!window.mod.antiLag,
-            zoom: !!window.mod.zoom,
-            menuStyleVariant: text(window.mod.menuStyleVariant || "", 32),
-            botNamePrefix: text(window.mod.botNamePrefix || "", 48)
-          }
-        : null
+      modSettings: summarizeModSettings(),
+      codeSlots: Object.values(CODE_SLOT_DEFS).map((entry) => summarizeCodeSlot(entry.id)),
+      player: summarizeEntity(window.player),
+      enemy: summarizeEntity(window.enemy),
+      playersCount: Array.isArray(window.players) ? window.players.length : null,
+      gameRef: summarizeGameRef(),
+      pvpRuntime: summarizePvpRuntime()
     };
   };
   const defaultAreas = () => {
@@ -867,13 +1353,282 @@
     node.dispatchEvent(new Event("change", { bubbles: true }));
     return { ok: true, element: summarizeElement(node, state.prefs.includeSensitive) };
   };
+  const SPECIAL_KEYCODES = {
+    enter: 13,
+    return: 13,
+    escape: 27,
+    esc: 27,
+    space: 32,
+    tab: 9,
+    shift: 16,
+    control: 17,
+    ctrl: 17,
+    alt: 18,
+    arrowup: 38,
+    arrowdown: 40,
+    arrowleft: 37,
+    arrowright: 39,
+    w: 87,
+    a: 65,
+    s: 83,
+    d: 68,
+    e: 69,
+    q: 81,
+    z: 90,
+    x: 88,
+    i: 73,
+    j: 74,
+    k: 75,
+    l: 76,
+    p: 80,
+    "1": 49,
+    "2": 50,
+    "3": 51,
+    "4": 52
+  };
+  const getKeyCode = (key) => {
+    const normalized = String(key || "").trim();
+    if (!normalized) {
+      return 0;
+    }
+    if (normalized.length === 1) {
+      return normalized.toUpperCase().charCodeAt(0);
+    }
+    return SPECIAL_KEYCODES[normalized.toLowerCase()] || 0;
+  };
+  const getKeyboardCode = (key) => {
+    const normalized = String(key || "").trim();
+    if (!normalized) {
+      return "";
+    }
+    if (normalized.length === 1) {
+      const upper = normalized.toUpperCase();
+      return /[A-Z]/.test(upper) ? `Key${upper}` : /[0-9]/.test(upper) ? `Digit${upper}` : upper;
+    }
+    const map = {
+      enter: "Enter",
+      return: "Enter",
+      escape: "Escape",
+      esc: "Escape",
+      space: "Space",
+      tab: "Tab",
+      shift: "ShiftLeft",
+      control: "ControlLeft",
+      ctrl: "ControlLeft",
+      alt: "AltLeft",
+      arrowup: "ArrowUp",
+      arrowdown: "ArrowDown",
+      arrowleft: "ArrowLeft",
+      arrowright: "ArrowRight"
+    };
+    return map[normalized.toLowerCase()] || normalized;
+  };
+  const invokeKeyHandler = (type, key) => {
+    const keyCode = getKeyCode(key);
+    const code = getKeyboardCode(key);
+    const eventLike = {
+      key: String(key || ""),
+      code,
+      keyCode,
+      which: keyCode,
+      bubbles: true,
+      cancelable: true,
+      defaultPrevented: false,
+      prevented: false,
+      stopPropagation() {},
+      stopImmediatePropagation() {},
+      preventDefault() {
+        this.defaultPrevented = true;
+        this.prevented = true;
+      }
+    };
+    try {
+      const handler = document[`on${type}`];
+      if (typeof handler === "function") {
+        handler.call(document, eventLike);
+      }
+    } catch {}
+    try {
+      const event = new KeyboardEvent(type, {
+        key: String(key || ""),
+        code,
+        bubbles: true,
+        cancelable: true
+      });
+      Object.defineProperty(event, "keyCode", { configurable: true, get: () => keyCode });
+      Object.defineProperty(event, "which", { configurable: true, get: () => keyCode });
+      document.dispatchEvent(event);
+      window.dispatchEvent(event);
+    } catch {}
+    return { key: String(key || ""), code, keyCode };
+  };
+  const dispatchGameKey = async (args) => {
+    const blocked = ensureAutomation("dispatch_key");
+    if (blocked) {
+      return blocked;
+    }
+    const key = String(args && (args.key || args.code) || "").trim();
+    if (!key) {
+      return { ok: false, error: "A key is required." };
+    }
+    const mode = String(args && args.mode || "press").trim().toLowerCase();
+    const repeat = Math.min(12, Math.max(1, Number(args && args.repeat) || 1));
+    const holdMs = Math.min(3000, Math.max(0, Number(args && args.holdMs) || 0));
+    const events = [];
+    for (let index = 0; index < repeat; index += 1) {
+      if (mode === "down") {
+        events.push(invokeKeyHandler("keydown", key));
+      } else if (mode === "up") {
+        events.push(invokeKeyHandler("keyup", key));
+      } else {
+        events.push(invokeKeyHandler("keydown", key));
+        if (holdMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, holdMs));
+        }
+        events.push(invokeKeyHandler("keyup", key));
+      }
+    }
+    return {
+      ok: true,
+      mode,
+      repeat,
+      events
+    };
+  };
+  const resolveCanvasPoint = (args) => {
+    const canvas = document.querySelector("canvas");
+    if (!canvas) {
+      return { ok: false, error: "Canvas not found." };
+    }
+    const rect = canvas.getBoundingClientRect();
+    let clientX = Number(args && args.clientX);
+    let clientY = Number(args && args.clientY);
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      const normalizedX = Number(args && (args.nx != null ? args.nx : args.x));
+      const normalizedY = Number(args && (args.ny != null ? args.ny : args.y));
+      if (Number.isFinite(normalizedX) && Number.isFinite(normalizedY)) {
+        clientX = rect.left + normalizedX * rect.width;
+        clientY = rect.top + normalizedY * rect.height;
+      } else {
+        clientX = rect.left + rect.width / 2;
+        clientY = rect.top + rect.height / 2;
+      }
+    }
+    clientX = Math.max(rect.left + 1, Math.min(rect.right - 1, clientX));
+    clientY = Math.max(rect.top + 1, Math.min(rect.bottom - 1, clientY));
+    return {
+      ok: true,
+      canvas,
+      rect,
+      clientX,
+      clientY
+    };
+  };
+  const fireCanvasMouseEvent = (canvas, type, clientX, clientY, button = 0) => {
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX,
+      clientY,
+      button,
+      buttons: button === 2 ? 2 : 1
+    });
+    canvas.dispatchEvent(event);
+    return {
+      type,
+      clientX: Math.round(clientX),
+      clientY: Math.round(clientY),
+      button
+    };
+  };
+  const dispatchCanvasPointer = async (args) => {
+    const blocked = ensureAutomation("dispatch_canvas_pointer");
+    if (blocked) {
+      return blocked;
+    }
+    const target = resolveCanvasPoint(args);
+    if (!target.ok) {
+      return target;
+    }
+    const action = String(args && args.action || "click").trim().toLowerCase();
+    const button = action === "rightclick" || Number(args && args.button) === 2 ? 2 : 0;
+    const steps = [];
+    steps.push(fireCanvasMouseEvent(target.canvas, "mousemove", target.clientX, target.clientY, button));
+    if (action === "move") {
+      return {
+        ok: true,
+        action,
+        point: { x: Math.round(target.clientX), y: Math.round(target.clientY) },
+        steps
+      };
+    }
+    if (action === "down") {
+      steps.push(fireCanvasMouseEvent(target.canvas, "mousedown", target.clientX, target.clientY, button));
+    } else if (action === "up") {
+      steps.push(fireCanvasMouseEvent(target.canvas, "mouseup", target.clientX, target.clientY, button));
+    } else {
+      steps.push(fireCanvasMouseEvent(target.canvas, "mousedown", target.clientX, target.clientY, button));
+      await new Promise((resolve) => setTimeout(resolve, Math.min(300, Math.max(0, Number(args && args.delayMs) || 24))));
+      steps.push(fireCanvasMouseEvent(target.canvas, "mouseup", target.clientX, target.clientY, button));
+      if (action === "rightclick") {
+        steps.push(fireCanvasMouseEvent(target.canvas, "contextmenu", target.clientX, target.clientY, button));
+      }
+    }
+    return {
+      ok: true,
+      action,
+      point: { x: Math.round(target.clientX), y: Math.round(target.clientY) },
+      steps
+    };
+  };
   const executeTool = async (tool, args) => {
     try {
       switch (tool) {
         case "collect_context":
-          return await buildContextSnapshot(Array.isArray(args && args.areas) ? args.areas : defaultAreas());
+          return sanitizeToolPayload(await buildContextSnapshot(Array.isArray(args && args.areas) ? args.areas : defaultAreas()), tool);
+        case "list_mod_settings":
+          return sanitizeToolPayload(listModSettings(), tool);
+        case "get_mod_setting":
+          return sanitizeToolPayload(getModSetting(args && args.path), tool);
+        case "set_mod_setting": {
+          const blocked = ensureAutomation("set_mod_setting");
+          if (blocked) {
+            return blocked;
+          }
+          return sanitizeToolPayload(setModSetting(args && args.path, args && args.value), tool);
+        }
+        case "set_mod_settings": {
+          const blocked = ensureAutomation("set_mod_settings");
+          if (blocked) {
+            return blocked;
+          }
+          return sanitizeToolPayload(setModSettings(args && args.updates), tool);
+        }
+        case "inspect_code_slot":
+          return sanitizeToolPayload({
+            ok: true,
+            slot: summarizeCodeSlot(args && args.slot)
+          }, tool);
+        case "set_code_slot": {
+          const blocked = ensureAutomation("set_code_slot");
+          if (blocked) {
+            return blocked;
+          }
+          return sanitizeToolPayload(applyCodeSlot(args && args.slot, args && args.code), tool);
+        }
+        case "clear_code_slot": {
+          const blocked = ensureAutomation("clear_code_slot");
+          if (blocked) {
+            return blocked;
+          }
+          return sanitizeToolPayload(applyCodeSlot(args && args.slot, ""), tool);
+        }
+        case "list_dump_targets":
+          return sanitizeToolPayload(listDumpTargets(args && args.query), tool);
+        case "inspect_dump_target":
+          return sanitizeToolPayload(inspectDumpTarget(args && (args.name || args.alias)), tool);
         case "inspect_selector":
-          return inspectSelector(args && args.selector);
+          return sanitizeToolPayload(inspectSelector(args && args.selector), tool);
         case "focus_selector": {
           const blocked = ensureAutomation("focus_selector");
           if (blocked) {
@@ -887,7 +1642,7 @@
           if (typeof node.focus === "function") {
             node.focus({ preventScroll: true });
           }
-          return { ok: true, element: summarizeElement(node, state.prefs.includeSensitive) };
+          return sanitizeToolPayload({ ok: true, element: summarizeElement(node, state.prefs.includeSensitive) }, tool);
         }
         case "click_selector": {
           const blocked = ensureAutomation("click_selector");
@@ -905,7 +1660,7 @@
             node.click();
           }
           node.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-          return { ok: true, element: summarizeElement(node, state.prefs.includeSensitive) };
+          return sanitizeToolPayload({ ok: true, element: summarizeElement(node, state.prefs.includeSensitive) }, tool);
         }
         case "type_selector": {
           const blocked = ensureAutomation("type_selector");
@@ -916,8 +1671,12 @@
           if (!node) {
             return { ok: false, error: "Selector not found." };
           }
-          return typeIntoElement(node, String(args && args.text || ""), !!(args && args.append));
+          return sanitizeToolPayload(typeIntoElement(node, String(args && args.text || ""), !!(args && args.append)), tool);
         }
+        case "dispatch_key":
+          return sanitizeToolPayload(await dispatchGameKey(args), tool);
+        case "dispatch_canvas_pointer":
+          return sanitizeToolPayload(await dispatchCanvasPointer(args), tool);
         case "run_script": {
           const blocked = ensureAutomation("run_script");
           if (blocked) {
@@ -927,9 +1686,15 @@
           if (!script) {
             return { ok: false, error: "No script provided." };
           }
+          if (/\b(fetch|XMLHttpRequest|WebSocket|EventSource|sendBeacon)\b/.test(script)) {
+            return { ok: false, error: "run_script network egress is blocked." };
+          }
+          if (/Function\.prototype\.toString|__renderFunctionDumpRegistry|\.source\b|customPvpCode|customAntiBotCode|botCode/.test(script)) {
+            return { ok: false, error: "run_script cannot access protected source fields." };
+          }
           const fn = new AsyncFunction(script);
           const result = await fn.call(window);
-          return { ok: true, result: jsonSafe(result) };
+          return sanitizeToolPayload({ ok: true, result: jsonSafe(result) }, tool);
         }
         default:
           return { ok: false, error: `Unsupported tool: ${tool}` };
@@ -1102,7 +1867,7 @@
     try {
       state.pendingLabel = "Calling AI backend";
       renderIfVisible();
-      for (let step = 0; step < 4; step += 1) {
+      for (let step = 0; step < 6; step += 1) {
         const output = await callAssistant(messages, context);
         if (output && output.type === "tool") {
           state.pendingLabel = `Running ${output.tool}`;
@@ -1131,7 +1896,7 @@
         pushConversation("assistant", finalMessage);
         return;
       }
-      addFeed("assistant", "Stopped after 4 tool iterations.", "loop guard");
+      addFeed("assistant", "Stopped after 6 tool iterations.", "loop guard");
     } catch (error) {
       addFeed("assistant", formatError(error), "request failed");
       notify(formatError(error), "error");
@@ -1329,7 +2094,7 @@
           <div class="rai-panel rai-copy">
             <span class="rai-kicker">Render AI Assistant</span>
             <div class="rai-title">Full mope.io runtime access <span>with debug + automation tools.</span></div>
-            <p>Live console logs, network traces, storage and application state, packet analyzer context, DOM inspection, automation actions, and optional screenshot analysis are wired into one assistant loop.</p>
+            <p>Live console logs, network traces, storage and application state, packet analyzer context, dump-target research, source-safe runtime inspection, live PvP/ESP/visual tuning, game controls, and optional screenshot analysis are wired into one assistant loop.</p>
             <div class="rai-pill-row">
               <div class="rai-pill">session <b>${esc(hasSession() ? "active" : "missing")}</b></div>
               <div class="rai-pill">admin <b>${esc(isAdmin() ? "yes" : "no")}</b></div>
@@ -1375,7 +2140,7 @@
               <button class="rai-toggle ${state.prefs.includeStorage ? "active" : ""}" data-rai-toggle="includeStorage" role="switch" aria-checked="${state.prefs.includeStorage ? "true" : "false"}" aria-pressed="${state.prefs.includeStorage ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Application Data</strong><span>Include storage, cookies, caches, and IndexedDB names.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeStorage ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
               <button class="rai-toggle ${state.prefs.includePackets ? "active" : ""}" data-rai-toggle="includePackets" role="switch" aria-checked="${state.prefs.includePackets ? "true" : "false"}" aria-pressed="${state.prefs.includePackets ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Packet Analyzer</strong><span>Send recent packet analyzer state and decoded event summaries.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includePackets ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
               <button class="rai-toggle ${state.prefs.includeSensitive ? "active" : ""}" data-rai-toggle="includeSensitive" role="switch" aria-checked="${state.prefs.includeSensitive ? "true" : "false"}" aria-pressed="${state.prefs.includeSensitive ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Sensitive Values</strong><span>Allow fuller storage and input value previews.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeSensitive ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
-              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation" role="switch" aria-checked="${state.prefs.allowAutomation ? "true" : "false"}" aria-pressed="${state.prefs.allowAutomation ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit click, type, focus, and run-script tool actions.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.allowAutomation ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation" role="switch" aria-checked="${state.prefs.allowAutomation ? "true" : "false"}" aria-pressed="${state.prefs.allowAutomation ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit clicks, typing, live mod edits, game key/pointer control, and guarded scripts.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.allowAutomation ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
             </div>
           </div>
         </section>
