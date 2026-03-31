@@ -1462,6 +1462,39 @@
     };
     return map[normalized.toLowerCase()] || normalized;
   };
+  const isDangerousAutomationKey = (key) => {
+    const normalized = String(key || "").trim().toLowerCase();
+    return [
+      "f5",
+      "browserrefresh",
+      "browserback",
+      "browserforward"
+    ].includes(normalized);
+  };
+  const elementCouldNavigate = (node) => {
+    if (!node || !(node instanceof Element)) {
+      return false;
+    }
+    const tag = String(node.tagName || "").toLowerCase();
+    if (tag === "a" && node.getAttribute("href")) {
+      return true;
+    }
+    if (tag === "form") {
+      return true;
+    }
+    const type = String(node.getAttribute("type") || "").toLowerCase();
+    if ((tag === "button" || tag === "input") && ["submit", "image", "reset"].includes(type)) {
+      return true;
+    }
+    if (typeof node.closest === "function" && node.closest("a[href], form")) {
+      return true;
+    }
+    return false;
+  };
+  const scriptContainsNavigation = (script) => {
+    const input = String(script || "");
+    return /\b(location\s*\.\s*(reload|assign|replace|href)\s*=?)|\b(window\s*\.\s*location\b)|\b(window\s*\.\s*open\b)|\b(history\s*\.\s*(go|back|forward)\b)|\b(requestSubmit|submit)\s*\(/i.test(input);
+  };
   const invokeKeyHandler = (type, key) => {
     const keyCode = getKeyCode(key);
     const code = getKeyboardCode(key);
@@ -1509,6 +1542,9 @@
     const key = String(args && (args.key || args.code) || "").trim();
     if (!key) {
       return { ok: false, error: "A key is required." };
+    }
+    if (isDangerousAutomationKey(key)) {
+      return { ok: false, error: `Navigation key ${key} is blocked.` };
     }
     const mode = String(args && args.mode || "press").trim().toLowerCase();
     const repeat = Math.min(12, Math.max(1, Number(args && args.repeat) || 1));
@@ -1692,6 +1728,9 @@
           if (!node) {
             return { ok: false, error: "Selector not found." };
           }
+          if (elementCouldNavigate(node)) {
+            return { ok: false, error: "Navigation-style clicks are blocked." };
+          }
           node.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
           node.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
           node.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -1727,6 +1766,9 @@
           }
           if (/\b(fetch|XMLHttpRequest|WebSocket|EventSource|sendBeacon)\b/.test(script)) {
             return { ok: false, error: "run_script network egress is blocked." };
+          }
+          if (scriptContainsNavigation(script)) {
+            return { ok: false, error: "run_script navigation and reload actions are blocked." };
           }
           if (/Function\.prototype\.toString|__renderFunctionDumpRegistry|\.source\b|customPvpCode|customAntiBotCode|botCode/.test(script)) {
             return { ok: false, error: "run_script cannot access protected source fields." };
