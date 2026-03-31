@@ -35,6 +35,7 @@
     networkEntries: [],
     attachment: null,
     pending: false,
+    pendingLabel: "",
     prefs: { ...DEFAULT_PREFS },
     lastContextAt: 0,
     lastModel: "",
@@ -798,8 +799,12 @@
     }
   };
   const togglePref = (key) => {
+    if (!(key in state.prefs)) {
+      return;
+    }
     state.prefs[key] = !state.prefs[key];
     saveState();
+    notify(`${key.replace(/([A-Z])/g, " $1").trim()} ${state.prefs[key] ? "enabled" : "disabled"}.`, "info");
     renderIfVisible();
   };
   const fileToDataUrl = (file) =>
@@ -889,7 +894,11 @@
       throw new Error(response && response.error ? response.error : "Assistant request failed.");
     }
     state.lastModel = text(response.model || "", 80);
-    return response.output || { type: "final", message: "No output." };
+    const output = response.output || null;
+    if ((!output || !output.message) && response.rawMessage) {
+      return { type: "final", message: clip(String(response.rawMessage || ""), 8000) || "No output." };
+    }
+    return output || { type: "final", message: "No output." };
   };
   const buildPromptContext = async () => {
     if (!state.prefs.autoContext) {
@@ -915,15 +924,20 @@
       return;
     }
     state.pending = true;
+    state.pendingLabel = "Collecting runtime context";
     renderIfVisible();
     pushConversation("user", trimmedPrompt);
     addFeed("user", trimmedPrompt, state.attachment ? `image attached | ${state.attachment.width}x${state.attachment.height}` : "live prompt");
     const messages = state.messages.slice(-12);
     let context = presetContext || await buildPromptContext();
     try {
+      state.pendingLabel = "Calling AI backend";
+      renderIfVisible();
       for (let step = 0; step < 4; step += 1) {
         const output = await callAssistant(messages, context);
         if (output && output.type === "tool") {
+          state.pendingLabel = `Running ${output.tool}`;
+          renderIfVisible();
           const meta = `${output.tool}${output.args ? ` | ${summarizeArgs(output.args)}` : ""}`;
           addFeed("tool", output.message || `Tool request: ${output.tool}`, meta);
           messages.push({ role: "assistant", content: clip(stable(output, 1800), 1800) });
@@ -936,6 +950,7 @@
             role: "user",
             content: `Tool result from ${output.tool}:\n${toolText}`
           });
+          state.pendingLabel = "Refreshing live context";
           context = await buildPromptContext();
           continue;
         }
@@ -953,6 +968,7 @@
       notify(formatError(error), "error");
     } finally {
       state.pending = false;
+      state.pendingLabel = "";
       saveState();
       renderIfVisible();
     }
@@ -979,7 +995,17 @@
     return `<div class="${className}">${items.map((item) => `<div>${esc(text(item, 260))}</div>`).join("")}</div>`;
   };
   const renderFeedMarkup = () => {
-    if (!state.feed.length) {
+    const pendingMarkup = state.pending ? `
+      <article class="rai-msg rai-msg-pending">
+        <div class="rai-msg-head">
+          <span class="rai-msg-role">AI Assistant</span>
+          <span class="rai-msg-meta">${esc(state.pendingLabel || "thinking")}</span>
+        </div>
+        <div class="rai-thinking"><span></span><span></span><span></span></div>
+        <div class="rai-msg-text">Reading live page state, collecting context, and preparing a response.</div>
+      </article>
+    ` : "";
+    if (!state.feed.length && !state.pending) {
       return `
         <div class="rai-empty">
           <strong>Ready.</strong>
@@ -997,7 +1023,7 @@
         ${renderSummaryList(entry.summary, "rai-summary")}
         ${renderSummaryList(entry.nextActions, "rai-next")}
       </article>
-    `).join("");
+    `).join("") + pendingMarkup;
   };
   const renderAttachmentMarkup = () => {
     if (!state.attachment) {
@@ -1047,6 +1073,18 @@
 #renderMenu .rai-pill-row,#renderMenu .rai-toolbar,#renderMenu .rai-actions{display:flex;flex-wrap:wrap;gap:10px}
 #renderMenu .rai-pill{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;border:1px solid rgba(128,190,255,.18);background:linear-gradient(180deg, rgba(19,31,52,.88), rgba(10,18,30,.96));color:#e8f4ff;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
 #renderMenu .rai-pill b{color:#81d8ff;font-weight:900}
+#renderMenu .rai-status-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}
+#renderMenu .rai-status-card{padding:16px;border-radius:22px;background:linear-gradient(180deg, rgba(18,28,46,.92), rgba(10,16,28,.96));border:1px solid rgba(126,186,255,.16);box-shadow:0 18px 38px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.05)}
+#renderMenu .rai-status-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
+#renderMenu .rai-status-title{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#dbefff;font-weight:900}
+#renderMenu .rai-status-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid rgba(129,193,255,.18);background:linear-gradient(180deg, rgba(22,36,58,.96), rgba(12,20,32,.98));color:#eff8ff;font-size:11px;font-weight:900;letter-spacing:.12em;text-transform:uppercase}
+#renderMenu .rai-status-dot{width:8px;height:8px;border-radius:999px;background:#7ee4ff;box-shadow:0 0 16px rgba(126,228,255,.55)}
+#renderMenu .rai-status-pill.is-busy .rai-status-dot{background:#ffd36f;box-shadow:0 0 18px rgba(255,211,111,.7);animation:raiPulse 1.2s ease-in-out infinite}
+#renderMenu .rai-status-copy{font-size:12px;line-height:1.6;color:rgba(232,243,252,.82)}
+#renderMenu .rai-status-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+#renderMenu .rai-status-metric{padding:12px;border-radius:16px;border:1px solid rgba(127,193,255,.14);background:linear-gradient(180deg, rgba(15,24,39,.94), rgba(10,16,26,.98))}
+#renderMenu .rai-status-metric b{display:block;font-size:18px;line-height:1;color:#f5fbff;font-weight:900;margin-bottom:6px}
+#renderMenu .rai-status-metric span{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:rgba(226,237,248,.66);font-weight:900}
 #renderMenu .rai-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
 #renderMenu .rai-panel{padding:16px}
 #renderMenu .rai-panel h3,#renderMenu .rai-feed-head h3,#renderMenu .rai-compose-head h3{margin:0;font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#dbefff}
@@ -1075,8 +1113,13 @@
 #renderMenu .rai-msg{padding:13px 14px;border-radius:18px;border:1px solid rgba(128,190,255,.12);background:linear-gradient(180deg, rgba(16,26,42,.94), rgba(10,16,28,.98))}
 #renderMenu .rai-msg-user{border-color:rgba(110,206,255,.25);background:linear-gradient(180deg, rgba(16,38,57,.94), rgba(8,20,34,.98))}
 #renderMenu .rai-msg-tool{border-color:rgba(255,204,102,.24);background:linear-gradient(180deg, rgba(51,35,13,.92), rgba(26,19,10,.98))}
+#renderMenu .rai-msg-pending{border-color:rgba(255,214,121,.28);background:linear-gradient(180deg, rgba(38,33,19,.94), rgba(18,15,10,.98))}
 #renderMenu .rai-msg-head{margin-bottom:8px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
 #renderMenu .rai-msg-text{font-size:12px;line-height:1.66;color:#eaf5ff}
+#renderMenu .rai-thinking{display:flex;align-items:center;gap:8px;margin:4px 0 10px}
+#renderMenu .rai-thinking span{width:10px;height:10px;border-radius:999px;background:linear-gradient(180deg, #ffd97f, #ffbb4d);box-shadow:0 0 14px rgba(255,197,92,.42);animation:raiThinking 1.15s ease-in-out infinite}
+#renderMenu .rai-thinking span:nth-child(2){animation-delay:.12s}
+#renderMenu .rai-thinking span:nth-child(3){animation-delay:.24s}
 #renderMenu .rai-summary,#renderMenu .rai-next{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}
 #renderMenu .rai-summary div,#renderMenu .rai-next div{padding-left:14px;position:relative}
 #renderMenu .rai-summary div::before,#renderMenu .rai-next div::before{content:"";position:absolute;left:0;top:.55em;width:6px;height:6px;border-radius:999px;background:#86dbff;box-shadow:0 0 12px rgba(134,219,255,.45)}
@@ -1095,8 +1138,10 @@
 @keyframes raiPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.12);opacity:.72}}
 @keyframes raiScan{0%,100%{transform:translateY(0)}50%{transform:translateY(-34px)}}
 @keyframes raiBlink{0%,44%,100%{transform:scaleY(1)}46%,48%{transform:scaleY(.18)}}
+@keyframes raiThinking{0%,100%{transform:translateY(0) scale(1);opacity:.55}50%{transform:translateY(-4px) scale(1.12);opacity:1}}
 @media (max-width:1220px){#renderMenu .rai-hero,#renderMenu .rai-grid{grid-template-columns:1fr}}
-@media (max-width:820px){#renderMenu .rai-shell{padding:12px;border-radius:18px}#renderMenu .rai-title{font-size:24px}#renderMenu .rai-quick-grid{grid-template-columns:1fr}}
+@media (max-width:980px){#renderMenu .rai-status-grid{grid-template-columns:1fr}#renderMenu .rai-status-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:820px){#renderMenu .rai-shell{padding:12px;border-radius:18px}#renderMenu .rai-title{font-size:24px}#renderMenu .rai-quick-grid{grid-template-columns:1fr}#renderMenu .rai-status-metrics{grid-template-columns:1fr}}
 `;
     document.head.appendChild(style);
   };
@@ -1107,6 +1152,7 @@
       ? window.menu.packetAnalyzer.records.length
       : 0;
     const statusText = !hasSession() ? "Admin session missing" : state.pending ? "Thinking..." : state.lastModel ? `Connected to ${state.lastModel}` : "Bridge armed";
+    const pendingDetail = state.pendingLabel || "Analyzing live context";
     return `
       <div class="rai-shell">
         <section class="rai-hero">
@@ -1124,6 +1170,25 @@
             </div>
           </div>
         </section>
+        <section class="rai-status-grid">
+          <div class="rai-status-card">
+            <div class="rai-status-head">
+              <div class="rai-status-title">Assistant Status</div>
+              <div class="rai-status-pill ${state.pending ? "is-busy" : ""}"><span class="rai-status-dot"></span>${esc(statusText)}</div>
+            </div>
+            <div class="rai-status-copy">${esc(state.pending ? pendingDetail : "Ready for debugging, runtime inspection, network tracing, and controlled automation.").replace(/\n/g, "<br>")}</div>
+          </div>
+          <div class="rai-status-card">
+            <div class="rai-status-head">
+              <div class="rai-status-title">Live Surface</div>
+            </div>
+            <div class="rai-status-metrics">
+              <div class="rai-status-metric"><b>${esc(String(consoleCount))}</b><span>Console Events</span></div>
+              <div class="rai-status-metric"><b>${esc(String(networkCount))}</b><span>Network Records</span></div>
+              <div class="rai-status-metric"><b>${esc(String(packetCount))}</b><span>Packet Events</span></div>
+            </div>
+          </div>
+        </section>
         <section class="rai-grid">
           <div class="rai-panel">
             <h3>Quick Ops</h3>
@@ -1137,11 +1202,11 @@
           <div class="rai-panel">
             <h3>Control Surface</h3>
             <div class="rai-toggle-grid">
-              <button class="rai-toggle ${state.prefs.autoContext ? "active" : ""}" data-rai-toggle="autoContext" aria-pressed="${state.prefs.autoContext ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Auto Context</strong><span>Send fresh page context on every prompt.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.autoContext ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
-              <button class="rai-toggle ${state.prefs.includeStorage ? "active" : ""}" data-rai-toggle="includeStorage" aria-pressed="${state.prefs.includeStorage ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Application Data</strong><span>Include storage, cookies, caches, and IndexedDB names.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeStorage ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
-              <button class="rai-toggle ${state.prefs.includePackets ? "active" : ""}" data-rai-toggle="includePackets" aria-pressed="${state.prefs.includePackets ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Packet Analyzer</strong><span>Send recent packet analyzer state and decoded event summaries.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includePackets ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
-              <button class="rai-toggle ${state.prefs.includeSensitive ? "active" : ""}" data-rai-toggle="includeSensitive" aria-pressed="${state.prefs.includeSensitive ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Sensitive Values</strong><span>Allow fuller storage and input value previews.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeSensitive ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
-              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation" aria-pressed="${state.prefs.allowAutomation ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit click, type, focus, and run-script tool actions.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.allowAutomation ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.autoContext ? "active" : ""}" data-rai-toggle="autoContext" role="switch" aria-checked="${state.prefs.autoContext ? "true" : "false"}" aria-pressed="${state.prefs.autoContext ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Auto Context</strong><span>Send fresh page context on every prompt.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.autoContext ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includeStorage ? "active" : ""}" data-rai-toggle="includeStorage" role="switch" aria-checked="${state.prefs.includeStorage ? "true" : "false"}" aria-pressed="${state.prefs.includeStorage ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Application Data</strong><span>Include storage, cookies, caches, and IndexedDB names.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeStorage ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includePackets ? "active" : ""}" data-rai-toggle="includePackets" role="switch" aria-checked="${state.prefs.includePackets ? "true" : "false"}" aria-pressed="${state.prefs.includePackets ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Packet Analyzer</strong><span>Send recent packet analyzer state and decoded event summaries.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includePackets ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.includeSensitive ? "active" : ""}" data-rai-toggle="includeSensitive" role="switch" aria-checked="${state.prefs.includeSensitive ? "true" : "false"}" aria-pressed="${state.prefs.includeSensitive ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Sensitive Values</strong><span>Allow fuller storage and input value previews.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.includeSensitive ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
+              <button class="rai-toggle ${state.prefs.allowAutomation ? "active" : ""}" data-rai-toggle="allowAutomation" role="switch" aria-checked="${state.prefs.allowAutomation ? "true" : "false"}" aria-pressed="${state.prefs.allowAutomation ? "true" : "false"}"><div class="rai-toggle-copy"><strong>Automation Armed</strong><span>Permit click, type, focus, and run-script tool actions.</span></div><div class="rai-toggle-meta"><span class="rai-toggle-state">${state.prefs.allowAutomation ? "On" : "Off"}</span><span class="rai-switch"></span></div></button>
             </div>
           </div>
         </section>
@@ -1157,7 +1222,7 @@
             <button class="rai-button rai-button-secondary" data-rai-action="snapshot">Collect Snapshot</button>
             <button class="rai-button rai-button-secondary" data-rai-action="clear">Clear Feed</button>
             <button class="rai-button rai-button-secondary" data-rai-action="upload">Upload Image</button>
-            <button class="rai-button" data-rai-action="send" ${state.pending ? "disabled" : ""}>${state.pending ? "Working..." : "Send Prompt"}</button>
+            <button class="rai-button" data-rai-action="send" ${state.pending ? "disabled" : ""}>${state.pending ? "AI Thinking..." : "Send Prompt"}</button>
           </div>
           <div class="rai-actions"><input id="renderAiFileInput" type="file" accept="image/*"></div>
         </section>
