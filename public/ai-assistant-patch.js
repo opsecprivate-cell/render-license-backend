@@ -30,6 +30,7 @@
   const state = {
     feed: [],
     messages: [],
+    composerDraft: "",
     consoleEntries: [],
     networkEntries: [],
     attachment: null,
@@ -49,6 +50,7 @@
       "'": "&#39;"
     }[ch] || ch));
   const text = (value, max = 600) => String(value == null ? "" : value).replace(/\s+/g, " ").trim().slice(0, max);
+  const draftText = (value, max = 8000) => String(value == null ? "" : value).replace(/\r\n/g, "\n").slice(0, max);
   const clip = (value, max = 1600) => {
     const stringValue = String(value == null ? "" : value);
     return stringValue.length > max ? `${stringValue.slice(0, max)}\n/* clipped */` : stringValue;
@@ -73,6 +75,7 @@
         JSON.stringify({
           messages: state.messages.slice(-MAX_MESSAGES),
           feed: state.feed.slice(-MAX_MESSAGES),
+          composerDraft: state.composerDraft,
           prefs: state.prefs,
           attachment: state.attachment
             ? {
@@ -112,6 +115,7 @@
           }))
           .slice(-MAX_MESSAGES);
       }
+      state.composerDraft = draftText(parsed && parsed.composerDraft || "", 8000);
       state.prefs = { ...DEFAULT_PREFS, ...(parsed && parsed.prefs && typeof parsed.prefs === "object" ? parsed.prefs : {}) };
       if (parsed && parsed.attachment && typeof parsed.attachment === "object") {
         const dataUrl = String(parsed.attachment.dataUrl || "").trim();
@@ -902,7 +906,7 @@
     return buildContextSnapshot(defaultAreas());
   };
   const runAssistantLoop = async (prompt, presetContext = null) => {
-    const trimmedPrompt = text(prompt, 4000);
+    const trimmedPrompt = draftText(prompt, 4000).trim();
     if (!trimmedPrompt) {
       return;
     }
@@ -956,10 +960,17 @@
   const quickPrompt = async (prompt, areas) => {
     const context = await buildContextSnapshot(areas);
     const composer = document.getElementById("renderAiComposer");
+    state.composerDraft = draftText(prompt, 8000);
+    saveState();
     if (composer) {
-      composer.value = prompt;
+      composer.value = state.composerDraft;
     }
     await runAssistantLoop(prompt, context);
+    state.composerDraft = "";
+    saveState();
+    if (composer) {
+      composer.value = "";
+    }
   };
   const renderSummaryList = (items, className) => {
     if (!Array.isArray(items) || !items.length) {
@@ -1141,7 +1152,7 @@
         <section class="rai-composer">
           <div class="rai-compose-head"><h3>Prompt + Tools</h3><span>${esc(state.attachment ? "image attached" : "text only")}</span></div>
           ${renderAttachmentMarkup()}
-          <textarea id="renderAiComposer" placeholder="Ask it to debug the page, inspect a selector, analyze recent errors, automate a click flow, or explain mope.io state." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+          <textarea id="renderAiComposer" placeholder="Ask it to debug the page, inspect a selector, analyze recent errors, automate a click flow, or explain mope.io state." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">${esc(state.composerDraft || "")}</textarea>
           <div class="rai-toolbar">
             <button class="rai-button rai-button-secondary" data-rai-action="snapshot">Collect Snapshot</button>
             <button class="rai-button rai-button-secondary" data-rai-action="clear">Clear Feed</button>
@@ -1177,6 +1188,11 @@
       composer.disabled = false;
       composer.style.pointerEvents = "auto";
       composer.style.userSelect = "text";
+      composer.value = state.composerDraft || "";
+      composer.addEventListener("input", () => {
+        state.composerDraft = draftText(composer.value, 8000);
+        saveState();
+      });
     }
     menu.querySelectorAll("[data-rai-toggle]").forEach((node) => {
       armInteractiveNode(node);
@@ -1221,7 +1237,12 @@
       }
     });
     menu.querySelector("[data-rai-action='send']")?.addEventListener("click", async () => {
-      await runAssistantLoop(composer ? composer.value : "");
+      const draft = composer ? composer.value : "";
+      state.composerDraft = draftText(draft, 8000);
+      saveState();
+      await runAssistantLoop(draft);
+      state.composerDraft = "";
+      saveState();
       if (composer) {
         composer.value = "";
       }
@@ -1229,7 +1250,12 @@
     composer?.addEventListener("keydown", async (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        await runAssistantLoop(composer.value);
+        const draft = composer.value;
+        state.composerDraft = draftText(draft, 8000);
+        saveState();
+        await runAssistantLoop(draft);
+        state.composerDraft = "";
+        saveState();
         composer.value = "";
       }
     });
@@ -1273,7 +1299,32 @@
     if (!menu || !window.menu || window.menu.currentTab !== TAB_ID) {
       return;
     }
+    const activeElement = document.activeElement;
+    const previousComposer = menu.querySelector("#renderAiComposer");
+    const shouldRestoreComposer = !!(previousComposer && activeElement === previousComposer);
+    const composerState = previousComposer ? {
+      value: previousComposer.value,
+      selectionStart: typeof previousComposer.selectionStart === "number" ? previousComposer.selectionStart : null,
+      selectionEnd: typeof previousComposer.selectionEnd === "number" ? previousComposer.selectionEnd : null,
+      scrollTop: previousComposer.scrollTop || 0
+    } : null;
+    if (composerState) {
+      state.composerDraft = draftText(composerState.value, 8000);
+    }
     renderTab();
+    if (shouldRestoreComposer) {
+      const nextComposer = menu.querySelector("#renderAiComposer");
+      if (nextComposer) {
+        nextComposer.focus({ preventScroll: true });
+        nextComposer.value = state.composerDraft || "";
+        if (composerState && composerState.selectionStart != null && composerState.selectionEnd != null) {
+          try {
+            nextComposer.setSelectionRange(composerState.selectionStart, composerState.selectionEnd);
+          } catch {}
+        }
+        nextComposer.scrollTop = composerState ? composerState.scrollTop : 0;
+      }
+    }
   };
   const installMenuHook = () => {
     if (!window.menu || typeof window.menu.renderTabContent !== "function") {
