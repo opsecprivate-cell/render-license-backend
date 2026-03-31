@@ -187,6 +187,15 @@
     return toHex(new Uint8Array(signature));
   };
   const getStoredAssistantAuth = () => {
+    const liveAuth = window.__RENDER_AI_AUTH__;
+    if (liveAuth && typeof liveAuth === "object") {
+      const sessionToken = String(liveAuth.sessionToken || "").trim();
+      const requestSecret = String(liveAuth.requestSecret || "").trim();
+      const hwid = String(liveAuth.hwid || "").trim().toUpperCase();
+      if (sessionToken && requestSecret && /^[A-F0-9]{16}$/.test(hwid)) {
+        return { sessionToken, requestSecret, hwid };
+      }
+    }
     const sessionToken = String(readStorageJson(sessionStorage, "_st_v2", "") || "").trim();
     const requestSecret = String(readStorageJson(sessionStorage, "_rs_v2", "") || "").trim();
     const storedHwid = String(readStorageJson(localStorage, "_hw_v2", "") || "").trim().toUpperCase();
