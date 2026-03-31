@@ -992,6 +992,7 @@
   const callAssistant = async (messages, context) => {
     const api = bridge();
     let response = null;
+    let bridgeError = null;
     if (api && hasSession()) {
       try {
         response = await api.callApi("/ai/assistant", {
@@ -1000,14 +1001,25 @@
           image: attachmentPayload()
         });
       } catch (error) {
-        const message = formatError(error);
-        if (!/blocked endpoint|secure bridge unavailable/i.test(message)) {
-          throw error;
-        }
+        bridgeError = error;
       }
     }
     if (!response) {
-      response = await directAssistantRequest(messages, context);
+      try {
+        response = await directAssistantRequest(messages, context);
+      } catch (directError) {
+        if (!bridgeError) {
+          throw directError;
+        }
+        const bridgeMessage = formatError(bridgeError);
+        const directMessage = formatError(directError);
+        if (/blocked endpoint|secure bridge unavailable|invalid session|no active session/i.test(bridgeMessage)) {
+          throw directError;
+        }
+        throw new Error(directMessage && directMessage !== bridgeMessage
+          ? `${bridgeMessage} | fallback: ${directMessage}`
+          : bridgeMessage);
+      }
     }
     if (!response || response.ok !== true) {
       throw new Error(response && response.error ? response.error : "Assistant request failed.");
