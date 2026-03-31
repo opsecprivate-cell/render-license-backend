@@ -4,7 +4,7 @@
   }
   window.__renderAiAssistantPatchLoaded = true;
 
-  const VERSION = "20260331.3";
+  const VERSION = "20260331.4";
   const TAB_ID = "ai";
   const TAB_HTML = `
     <i class="bx bx-bot"></i>
@@ -20,6 +20,7 @@
   const MAX_NETWORK = 120;
   const MAX_PACKET_RECORDS = 28;
   const MAX_IMAGE_BYTES = 4_800_000;
+  const ASSISTANT_REQUEST_TIMEOUT_MS = 90_000;
   const SOURCE_FIELD_KEYS = new Set([
     "source",
     "script",
@@ -326,7 +327,7 @@
       payload.adminKey = adminKey;
     }
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    const timeoutId = setTimeout(() => controller.abort(), ASSISTANT_REQUEST_TIMEOUT_MS);
     let response;
     let responseText = "";
     try {
@@ -339,7 +340,7 @@
       responseText = await response.text();
     } catch (error) {
       if (error && error.name === "AbortError") {
-        throw new Error("AI request timed out.");
+        throw new Error(`AI request timed out after ${Math.floor(ASSISTANT_REQUEST_TIMEOUT_MS / 1000)}s.`);
       }
       throw error;
     } finally {
@@ -1250,7 +1251,7 @@
     };
   };
   const defaultAreas = () => {
-    const areas = ["console", "network", "dom", "performance", "mope"];
+    const areas = ["console", "dom", "mope"];
     if (state.prefs.includeStorage) {
       areas.push("storage");
     }
