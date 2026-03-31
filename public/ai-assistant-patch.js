@@ -4,7 +4,7 @@
   }
   window.__renderAiAssistantPatchLoaded = true;
 
-  const VERSION = "20260331.1";
+  const VERSION = "20260331.2";
   const TAB_ID = "ai";
   const TAB_HTML = `
     <i class="bx bx-bot"></i>
@@ -256,12 +256,26 @@
     if (adminKey) {
       payload.adminKey = adminKey;
     }
-    const response = await fetch(`${getBackendUrl()}/ai/assistant`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const responseText = await response.text();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    let response;
+    let responseText = "";
+    try {
+      response = await fetch(`${getBackendUrl()}/ai/assistant`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      responseText = await response.text();
+    } catch (error) {
+      if (error && error.name === "AbortError") {
+        throw new Error("AI request timed out.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
     let json = {};
     if (responseText) {
       try {
@@ -1007,31 +1021,38 @@
     };
   };
   const callAssistant = async (messages, context) => {
-    const api = bridge();
     let response = null;
-    let bridgeError = null;
-    if (api && hasSession()) {
+    let directError = null;
+    try {
+      response = await directAssistantRequest(messages, context);
+    } catch (error) {
+      directError = error;
+    }
+    if (!response) {
+      const api = bridge();
+      let bridgeError = null;
       try {
-        response = await api.callApi("/ai/assistant", {
-          messages,
-          context,
-          image: attachmentPayload()
-        });
+        if (api && hasSession()) {
+          response = await api.callApi("/ai/assistant", {
+            messages,
+            context,
+            image: attachmentPayload()
+          });
+        }
       } catch (error) {
         bridgeError = error;
       }
-    }
-    if (!response) {
-      try {
-        response = await directAssistantRequest(messages, context);
-      } catch (directError) {
+      if (!response) {
         if (!bridgeError) {
-          throw directError;
+          throw directError || new Error("Assistant request failed.");
+        }
+        if (!directError) {
+          throw bridgeError;
         }
         const bridgeMessage = formatError(bridgeError);
         const directMessage = formatError(directError);
-        if (/blocked endpoint|secure bridge unavailable|invalid session|no active session/i.test(bridgeMessage)) {
-          throw directError;
+        if (/blocked endpoint|secure bridge unavailable|invalid session|no active session|session invalid/i.test(bridgeMessage)) {
+          throw directError || bridgeError;
         }
         throw new Error(directMessage && directMessage !== bridgeMessage
           ? `${bridgeMessage} | fallback: ${directMessage}`
