@@ -1247,6 +1247,37 @@
         node.addEventListener(type, stopUiPropagation, true);
       });
     };
+    const bindPressAction = (node, handler) => {
+      if (!node) {
+        return;
+      }
+      const wrapped = async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await handler(event);
+      };
+      node.addEventListener("click", wrapped, true);
+      node.addEventListener("keydown", async (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          await wrapped(event);
+        }
+      }, true);
+    };
+    const runComposerPrompt = async () => {
+      const draft = composer ? composer.value : "";
+      state.composerDraft = draftText(draft, 8000);
+      saveState();
+      if (!state.composerDraft.trim()) {
+        notify("Enter a prompt first.", "warn");
+        return;
+      }
+      await runAssistantLoop(draft);
+      state.composerDraft = "";
+      saveState();
+      if (composer) {
+        composer.value = "";
+      }
+    };
     armInteractiveNode(composer);
     if (composer) {
       composer.readOnly = false;
@@ -1261,11 +1292,19 @@
     }
     menu.querySelectorAll("[data-rai-toggle]").forEach((node) => {
       armInteractiveNode(node);
-      node.addEventListener("click", () => togglePref(node.getAttribute("data-rai-toggle")));
+      bindPressAction(node, async () => {
+        if (state.pending) {
+          return;
+        }
+        togglePref(node.getAttribute("data-rai-toggle"));
+      });
     });
     menu.querySelectorAll("[data-rai-quick]").forEach((node) => {
       armInteractiveNode(node);
-      node.addEventListener("click", async () => {
+      bindPressAction(node, async () => {
+        if (state.pending) {
+          return;
+        }
         const mode = node.getAttribute("data-rai-quick");
         if (mode === "analyze") await quickPrompt("Analyze the current mope.io page state. Explain key issues, risks, and the best next debugging step.", defaultAreas());
         else if (mode === "errors") await quickPrompt("Focus on recent errors. Explain the likely root cause and exactly what should be inspected next.", ["console", "network", "dom", "packet", "mope"]);
@@ -1276,24 +1315,37 @@
     const fileInput = menu.querySelector("#renderAiFileInput");
     armInteractiveNode(fileInput);
     menu.querySelectorAll("[data-rai-action]").forEach((node) => armInteractiveNode(node));
-    menu.querySelector("[data-rai-action='upload']")?.addEventListener("click", () => fileInput && fileInput.click());
+    bindPressAction(menu.querySelector("[data-rai-action='upload']"), async () => {
+      if (state.pending) {
+        return;
+      }
+      if (fileInput) {
+        fileInput.click();
+      }
+    });
     fileInput?.addEventListener("change", async (event) => {
       const file = event.target && event.target.files && event.target.files[0] ? event.target.files[0] : null;
       event.target.value = "";
       await handleAttachment(file);
     });
-    menu.querySelector("[data-rai-action='drop-attachment']")?.addEventListener("click", () => {
+    bindPressAction(menu.querySelector("[data-rai-action='drop-attachment']"), async () => {
       state.attachment = null;
       saveState();
       renderIfVisible();
     });
-    menu.querySelector("[data-rai-action='clear']")?.addEventListener("click", () => {
+    bindPressAction(menu.querySelector("[data-rai-action='clear']"), async () => {
+      if (state.pending) {
+        return;
+      }
       state.feed = [];
       state.messages = [];
       saveState();
       renderIfVisible();
     });
-    menu.querySelector("[data-rai-action='snapshot']")?.addEventListener("click", async () => {
+    bindPressAction(menu.querySelector("[data-rai-action='snapshot']"), async () => {
+      if (state.pending) {
+        return;
+      }
       try {
         const snapshot = await buildContextSnapshot(defaultAreas());
         addFeed("assistant", "Fresh context snapshot collected.", "snapshot", { summary: [clip(stable(snapshot, 2400), 2400)] });
@@ -1301,27 +1353,11 @@
         notify(formatError(error), "error");
       }
     });
-    menu.querySelector("[data-rai-action='send']")?.addEventListener("click", async () => {
-      const draft = composer ? composer.value : "";
-      state.composerDraft = draftText(draft, 8000);
-      saveState();
-      await runAssistantLoop(draft);
-      state.composerDraft = "";
-      saveState();
-      if (composer) {
-        composer.value = "";
-      }
-    });
+    bindPressAction(menu.querySelector("[data-rai-action='send']"), runComposerPrompt);
     composer?.addEventListener("keydown", async (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        const draft = composer.value;
-        state.composerDraft = draftText(draft, 8000);
-        saveState();
-        await runAssistantLoop(draft);
-        state.composerDraft = "";
-        saveState();
-        composer.value = "";
+        await runComposerPrompt();
       }
     });
     const feed = menu.querySelector("#renderAiFeed");
