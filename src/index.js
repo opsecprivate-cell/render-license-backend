@@ -135,6 +135,7 @@ const CONFIG = {
 const requestNonceCache = new Map();
 let chatInsertCounter = 0;
 let scriptCache = { mtimeMs: 0, content: "" };
+let aiAssistantPatchCache = { mtimeMs: 0, content: "" };
 let discordClient = null;
 let discordAutoMessageTimer = null;
 let discordReconnectTimer = null;
@@ -2155,7 +2156,8 @@ async function getScriptSource(req) {
     if (!response.ok) {
       throw new Error(`SCRIPT_SOURCE_URL fetch failed with ${response.status}`);
     }
-    return rewriteScriptServerUrl(await response.text(), req);
+    const rewritten = rewriteScriptServerUrl(await response.text(), req);
+    return appendAiAssistantInlinePatch(rewritten);
   }
 
   const stat = await fs.stat(CONFIG.scriptSourcePath);
@@ -2165,7 +2167,7 @@ async function getScriptSource(req) {
       content: await fs.readFile(CONFIG.scriptSourcePath, "utf8")
     };
   }
-  return rewriteScriptServerUrl(scriptCache.content, req);
+  return appendAiAssistantInlinePatch(rewriteScriptServerUrl(scriptCache.content, req));
 }
 
 function rewriteScriptServerUrl(source, req) {
@@ -2174,6 +2176,30 @@ function rewriteScriptServerUrl(source, req) {
     /serverUrl:\s*"[^"]+"/,
     `serverUrl: "${origin}"`
   );
+}
+
+async function appendAiAssistantInlinePatch(source) {
+  const base = String(source || "");
+  if (base.includes("window.__renderAiAssistantPatchLoaded")) {
+    return base;
+  }
+  const patchSource = await getAiAssistantPatchSource();
+  if (!patchSource.trim()) {
+    return base;
+  }
+  return `${base}\n/* ===================== RENDER AI ASSISTANT INLINE PATCH ===================== */\n${patchSource}\n`;
+}
+
+async function getAiAssistantPatchSource() {
+  const patchPath = path.resolve(__dirname, "..", "public", "ai-assistant-patch.js");
+  const stat = await fs.stat(patchPath);
+  if (stat.mtimeMs !== aiAssistantPatchCache.mtimeMs) {
+    aiAssistantPatchCache = {
+      mtimeMs: stat.mtimeMs,
+      content: await fs.readFile(patchPath, "utf8")
+    };
+  }
+  return aiAssistantPatchCache.content || "";
 }
 
 function getPublicOrigin(req) {
