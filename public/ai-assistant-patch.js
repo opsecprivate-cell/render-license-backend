@@ -4,7 +4,7 @@
   }
   window.__renderAiAssistantPatchLoaded = true;
 
-  const VERSION = "20260331.4";
+  const VERSION = "20260331.5";
   const TAB_ID = "ai";
   const TAB_HTML = `
     <i class="bx bx-bot"></i>
@@ -21,6 +21,7 @@
   const MAX_PACKET_RECORDS = 28;
   const MAX_IMAGE_BYTES = 4_800_000;
   const ASSISTANT_REQUEST_TIMEOUT_MS = 90_000;
+  const MAX_CONTEXT_WINDOW_CHARS = 48_000;
   const SOURCE_FIELD_KEYS = new Set([
     "source",
     "script",
@@ -70,6 +71,8 @@
     pendingLabel: "",
     prefs: { ...DEFAULT_PREFS },
     lastContextAt: 0,
+    lastContextChars: 0,
+    lastContextAreas: [],
     lastModel: "",
     booted: false
   };
@@ -132,6 +135,39 @@
     } catch {
       return clip(String(value), max);
     }
+  };
+  const countContextChars = (value) => {
+    try {
+      return JSON.stringify(value).length;
+    } catch {
+      return String(value == null ? "" : value).length;
+    }
+  };
+  const formatCompactCount = (value) => {
+    const number = Number(value) || 0;
+    if (number >= 1_000_000) {
+      return `${Math.round(number / 100_000) / 10}m`;
+    }
+    if (number >= 1_000) {
+      return `${Math.round(number / 100) / 10}k`;
+    }
+    return String(number);
+  };
+  const describeContextBudget = () => {
+    const used = Math.max(0, Number(state.lastContextChars) || 0);
+    const budget = MAX_CONTEXT_WINDOW_CHARS;
+    const remaining = Math.max(0, budget - used);
+    const percent = Math.max(0, Math.min(100, Math.round((used / budget) * 100)));
+    const areas = Array.isArray(state.lastContextAreas) ? state.lastContextAreas.slice(0, 8) : [];
+    return {
+      used,
+      budget,
+      remaining,
+      percent,
+      areas,
+      compact: `${percent}%`,
+      detail: `${formatCompactCount(used)} / ${formatCompactCount(budget)} chars`
+    };
   };
   const pushLimited = (list, item, max) => {
     list.push(item);
@@ -1294,6 +1330,8 @@
       snapshot.mope = collectMopeSnapshot();
     }
     state.lastContextAt = Date.now();
+    state.lastContextChars = countContextChars(snapshot);
+    state.lastContextAreas = Array.from(wanted);
     return snapshot;
   };
   const getStyleSubset = (node) => {
@@ -1837,7 +1875,7 @@
   };
   const buildPromptContext = async () => {
     if (!state.prefs.autoContext) {
-      return {
+      const snapshot = {
         capturedAt: nowIso(),
         page: {
           href: location.href,
@@ -1846,6 +1884,10 @@
           admin: isAdmin()
         }
       };
+      state.lastContextAt = Date.now();
+      state.lastContextChars = countContextChars(snapshot);
+      state.lastContextAreas = ["page"];
+      return snapshot;
     }
     return buildContextSnapshot(defaultAreas());
   };
@@ -1929,15 +1971,33 @@
     }
     return `<div class="${className}">${items.map((item) => `<div>${esc(text(item, 260))}</div>`).join("")}</div>`;
   };
+  const renderContextMeter = () => {
+    const budget = describeContextBudget();
+    const areaText = budget.areas.length ? budget.areas.join(", ") : "minimal page context";
+    return `
+      <div class="rai-context-chip" tabindex="0" role="note" aria-label="Context usage ${esc(budget.compact)}">
+        <span class="rai-context-bar"><span style="width:${esc(String(Math.max(8, budget.percent)))}%"></span></span>
+        <span class="rai-context-copy">Context ${esc(budget.compact)}</span>
+        <div class="rai-context-pop">
+          <strong>Context window</strong>
+          <div>${esc(`${budget.percent}% used (${100 - budget.percent}% left)`)}</div>
+          <div>${esc(`${formatCompactCount(budget.used)} chars used`)}</div>
+          <div>${esc(`${formatCompactCount(budget.remaining)} chars left`)}</div>
+          <div>${esc(`Areas: ${areaText}`)}</div>
+        </div>
+      </div>
+    `;
+  };
   const renderFeedMarkup = () => {
     const pendingMarkup = state.pending ? `
       <article class="rai-msg rai-msg-pending">
         <div class="rai-msg-head">
-          <span class="rai-msg-role">AI Assistant</span>
+          <span class="rai-msg-role"><span class="rai-msg-icon">◌</span>Assistant</span>
           <span class="rai-msg-meta">${esc(state.pendingLabel || "thinking")}</span>
         </div>
         <div class="rai-thinking"><span></span><span></span><span></span></div>
         <div class="rai-msg-text">Reading live page state, collecting context, and preparing a response.</div>
+        <div class="rai-msg-stage">Stage · ${esc(state.pendingLabel || "Thinking")}</div>
       </article>
     ` : "";
     if (!state.feed.length && !state.pending) {
@@ -1948,17 +2008,21 @@
         </div>
       `;
     }
-    return state.feed.map((entry) => `
+    return state.feed.map((entry) => {
+      const roleLabel = entry.role === "user" ? "You" : entry.role === "tool" ? "Tool Loop" : "Assistant";
+      const roleIcon = entry.role === "user" ? "◈" : entry.role === "tool" ? "◎" : "✦";
+      return `
       <article class="rai-msg rai-msg-${esc(entry.role)}">
         <div class="rai-msg-head">
-          <span class="rai-msg-role">${esc(entry.role === "user" ? "You" : entry.role === "tool" ? "Tool Loop" : "AI Assistant")}</span>
+          <span class="rai-msg-role"><span class="rai-msg-icon">${esc(roleIcon)}</span>${esc(roleLabel)}</span>
           <span class="rai-msg-meta">${esc(entry.meta || "")}</span>
         </div>
         <div class="rai-msg-text">${esc(entry.text).replace(/\n/g, "<br>")}</div>
         ${renderSummaryList(entry.summary, "rai-summary")}
         ${renderSummaryList(entry.nextActions, "rai-next")}
       </article>
-    `).join("") + pendingMarkup;
+    `;
+    }).join("") + pendingMarkup;
   };
   const renderAttachmentMarkup = () => {
     if (!state.attachment) {
@@ -1982,101 +2046,116 @@
     const style = document.createElement("style");
     style.id = "renderAiAssistantStyle";
     style.textContent = `
-#renderMenu .rai-shell{position:relative;display:grid;gap:16px;min-height:640px;padding:18px;border-radius:24px;background:radial-gradient(circle at top left, rgba(100,191,255,.18), transparent 28%),radial-gradient(circle at top right, rgba(255,195,87,.18), transparent 22%),linear-gradient(180deg, rgba(10,18,30,.96), rgba(6,11,20,.98));border:1px solid rgba(121,176,236,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 24px 54px rgba(0,0,0,.28);overflow:hidden}
-#renderMenu .rai-shell::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px),linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px);background-size:42px 42px;mask-image:linear-gradient(180deg, rgba(255,255,255,.6), transparent 80%);pointer-events:none;opacity:.35}
-#renderMenu .rai-hero{position:relative;display:grid;grid-template-columns:minmax(220px, 300px) 1fr;gap:18px;align-items:stretch}
-#renderMenu .rai-robot-card,#renderMenu .rai-panel,#renderMenu .rai-feed-card,#renderMenu .rai-composer{position:relative;border-radius:22px;background:linear-gradient(180deg, rgba(18,28,46,.92), rgba(10,16,28,.96));border:1px solid rgba(126,186,255,.16);box-shadow:0 18px 38px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.05)}
-#renderMenu .rai-robot-card{overflow:hidden;padding:18px;display:grid;place-items:center;min-height:240px}
-#renderMenu .rai-robot-card::after{content:"";position:absolute;inset:auto -16% -42% -16%;height:50%;background:radial-gradient(circle, rgba(109,212,255,.26), transparent 70%);filter:blur(10px)}
-#renderMenu .rai-robot{position:relative;width:168px;height:188px;display:grid;place-items:center;transform:translateZ(0)}
-#renderMenu .rai-robot-orbit,#renderMenu .rai-robot-orbit::before,#renderMenu .rai-robot-orbit::after{position:absolute;inset:18px;border-radius:999px;border:1px solid rgba(120,198,255,.16);animation:raiOrbit 10s linear infinite}
+#renderMenu .rai-shell{position:relative;display:grid;gap:16px;min-height:700px;padding:18px;border-radius:24px;background:linear-gradient(180deg, rgba(13,20,33,.98), rgba(8,13,23,.98));border:1px solid rgba(127,151,185,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 28px 56px rgba(0,0,0,.24);overflow:hidden}
+#renderMenu .rai-shell::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at top left, rgba(216,173,92,.07), transparent 32%),radial-gradient(circle at bottom right, rgba(92,140,216,.08), transparent 34%);pointer-events:none}
+#renderMenu .rai-hero{position:relative;display:grid;grid-template-columns:minmax(220px, 280px) 1fr;gap:16px;align-items:stretch}
+#renderMenu .rai-robot-card,#renderMenu .rai-panel,#renderMenu .rai-feed-card,#renderMenu .rai-composer{position:relative;border-radius:22px;background:linear-gradient(180deg, rgba(16,24,38,.96), rgba(10,15,25,.98));border:1px solid rgba(124,145,176,.14);box-shadow:0 14px 28px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.04)}
+#renderMenu .rai-robot-card{overflow:hidden;padding:18px;display:grid;grid-template-rows:1fr auto;gap:14px;min-height:238px}
+#renderMenu .rai-robot-card::after{content:"";position:absolute;inset:auto 16px 16px 16px;height:1px;background:linear-gradient(90deg, transparent, rgba(212,181,115,.28), transparent)}
+#renderMenu .rai-robot{position:relative;width:156px;height:170px;display:grid;place-items:center;margin:auto}
+#renderMenu .rai-robot-orbit,#renderMenu .rai-robot-orbit::before,#renderMenu .rai-robot-orbit::after{position:absolute;inset:18px;border-radius:999px;border:1px solid rgba(181,160,119,.12);animation:raiOrbit 18s linear infinite}
 #renderMenu .rai-robot-orbit::before,#renderMenu .rai-robot-orbit::after{content:"";inset:-12px}
-#renderMenu .rai-robot-orbit::after{inset:18px;animation-duration:5.6s;animation-direction:reverse}
-#renderMenu .rai-robot-head{position:relative;width:118px;height:124px;border-radius:30px 30px 34px 34px;background:linear-gradient(180deg, rgba(31,50,81,.98), rgba(18,30,49,.98));border:1px solid rgba(151,213,255,.34);box-shadow:0 0 0 1px rgba(255,255,255,.04) inset, 0 18px 30px rgba(0,0,0,.24)}
-#renderMenu .rai-robot-head::before{content:"";position:absolute;left:50%;top:-22px;width:4px;height:24px;margin-left:-2px;border-radius:999px;background:linear-gradient(180deg, rgba(174,233,255,.9), rgba(45,134,209,.3))}
-#renderMenu .rai-robot-head::after{content:"";position:absolute;left:50%;top:-32px;width:14px;height:14px;margin-left:-7px;border-radius:999px;background:#8be4ff;box-shadow:0 0 18px rgba(128,228,255,.75);animation:raiPulse 1.8s ease-in-out infinite}
-#renderMenu .rai-robot-face{position:absolute;inset:16px 12px 20px;border-radius:22px;background:linear-gradient(180deg, rgba(7,13,24,.92), rgba(10,18,32,.98));border:1px solid rgba(110,180,255,.2);overflow:hidden}
-#renderMenu .rai-robot-face::before{content:"";position:absolute;inset:auto -30% 16px -30%;height:2px;background:linear-gradient(90deg, transparent, rgba(147,219,255,.9), transparent);box-shadow:0 0 16px rgba(147,219,255,.7);animation:raiScan 3.4s ease-in-out infinite}
-#renderMenu .rai-eyes{position:absolute;top:34px;left:18px;right:18px;display:flex;justify-content:space-between}
-#renderMenu .rai-eye{width:26px;height:18px;border-radius:999px;background:linear-gradient(90deg, rgba(82,208,255,.72), rgba(188,244,255,1));box-shadow:0 0 20px rgba(89,216,255,.72);animation:raiBlink 4s infinite}
-#renderMenu .rai-mouth{position:absolute;left:50%;bottom:22px;width:58px;height:8px;margin-left:-29px;border-radius:999px;background:linear-gradient(90deg, rgba(74,176,255,.18), rgba(177,236,255,.9), rgba(74,176,255,.18));box-shadow:0 0 18px rgba(87,191,255,.42)}
+#renderMenu .rai-robot-orbit::after{animation-duration:11s;animation-direction:reverse}
+#renderMenu .rai-robot-head{position:relative;width:112px;height:120px;border-radius:28px 28px 34px 34px;background:linear-gradient(180deg, rgba(34,49,72,.98), rgba(20,30,46,.98));border:1px solid rgba(191,172,133,.2);box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 18px 30px rgba(0,0,0,.2)}
+#renderMenu .rai-robot-head::before{content:"";position:absolute;left:50%;top:-22px;width:4px;height:24px;margin-left:-2px;border-radius:999px;background:linear-gradient(180deg, rgba(216,192,142,.9), rgba(92,140,216,.25))}
+#renderMenu .rai-robot-head::after{content:"";position:absolute;left:50%;top:-33px;width:14px;height:14px;margin-left:-7px;border-radius:999px;background:#d7bb7f;box-shadow:0 0 16px rgba(215,187,127,.26);animation:raiPulse 2.6s ease-in-out infinite}
+#renderMenu .rai-robot-face{position:absolute;inset:16px 12px 20px;border-radius:22px;background:linear-gradient(180deg, rgba(8,14,24,.96), rgba(11,17,27,.98));border:1px solid rgba(122,145,182,.16);overflow:hidden}
+#renderMenu .rai-robot-face::before{content:"";position:absolute;inset:auto -30% 18px -30%;height:2px;background:linear-gradient(90deg, transparent, rgba(214,186,122,.65), transparent);box-shadow:0 0 12px rgba(214,186,122,.22);animation:raiScan 4.6s ease-in-out infinite}
+#renderMenu .rai-eyes{position:absolute;top:35px;left:18px;right:18px;display:flex;justify-content:space-between}
+#renderMenu .rai-eye{width:24px;height:16px;border-radius:999px;background:linear-gradient(90deg, rgba(120,174,232,.58), rgba(218,238,255,.9));animation:raiBlink 4.8s infinite}
+#renderMenu .rai-mouth{position:absolute;left:50%;bottom:24px;width:54px;height:7px;margin-left:-27px;border-radius:999px;background:linear-gradient(90deg, rgba(214,186,122,.1), rgba(214,186,122,.82), rgba(214,186,122,.1))}
 #renderMenu .rai-copy{display:grid;gap:12px;padding:18px 20px}
-#renderMenu .rai-kicker{display:inline-flex;align-items:center;gap:8px;width:max-content;padding:7px 12px;border-radius:999px;background:rgba(17,31,52,.78);border:1px solid rgba(122,186,255,.24);color:#bfe6ff;font-size:11px;font-weight:900;letter-spacing:.18em;text-transform:uppercase}
-#renderMenu .rai-title{font-size:32px;line-height:1.02;font-weight:900;letter-spacing:-.04em;color:#f5fbff;text-wrap:balance}
-#renderMenu .rai-title span{display:block;color:#84d9ff;text-shadow:0 0 24px rgba(85,204,255,.26)}
-#renderMenu .rai-copy p{margin:0;max-width:780px;color:rgba(226,237,248,.78);font-size:13px;line-height:1.6}
-#renderMenu .rai-pill-row,#renderMenu .rai-toolbar,#renderMenu .rai-actions{display:flex;flex-wrap:wrap;gap:10px}
-#renderMenu .rai-pill{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;border:1px solid rgba(128,190,255,.18);background:linear-gradient(180deg, rgba(19,31,52,.88), rgba(10,18,30,.96));color:#e8f4ff;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
-#renderMenu .rai-pill b{color:#81d8ff;font-weight:900}
-#renderMenu .rai-status-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}
-#renderMenu .rai-status-card{padding:16px;border-radius:22px;background:linear-gradient(180deg, rgba(18,28,46,.92), rgba(10,16,28,.96));border:1px solid rgba(126,186,255,.16);box-shadow:0 18px 38px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.05)}
+#renderMenu .rai-copy-top,#renderMenu .rai-feed-head,#renderMenu .rai-compose-head,#renderMenu .rai-msg-head,#renderMenu .rai-status-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+#renderMenu .rai-copy-side,#renderMenu .rai-feed-side,#renderMenu .rai-compose-side{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#renderMenu .rai-kicker{display:inline-flex;align-items:center;gap:8px;width:max-content;padding:7px 12px;border-radius:999px;background:rgba(32,44,65,.92);border:1px solid rgba(175,154,116,.2);color:#e7d2a0;font-size:11px;font-weight:900;letter-spacing:.16em;text-transform:uppercase}
+#renderMenu .rai-kicker-dot{width:8px;height:8px;border-radius:999px;background:#d6b46e;box-shadow:0 0 0 4px rgba(214,180,110,.12)}
+#renderMenu .rai-model-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 11px;border-radius:999px;background:rgba(18,27,42,.9);border:1px solid rgba(124,145,176,.16);color:rgba(228,235,245,.82);font-size:11px;font-weight:800}
+#renderMenu .rai-title{font-size:30px;line-height:1.04;font-weight:900;letter-spacing:-.04em;color:#f3f6fb;text-wrap:balance;max-width:820px}
+#renderMenu .rai-title span{display:block;color:#cdd7e6}
+#renderMenu .rai-copy p{margin:0;max-width:820px;color:rgba(222,228,238,.76);font-size:13px;line-height:1.7}
+#renderMenu .rai-pill-row,#renderMenu .rai-toolbar,#renderMenu .rai-actions,#renderMenu .rai-head-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+#renderMenu .rai-pill{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border-radius:14px;border:1px solid rgba(124,145,176,.14);background:rgba(17,24,37,.92);color:#e6edf7;font-size:11px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}
+#renderMenu .rai-pill b{color:#f0d69d;font-weight:900}
+#renderMenu .rai-status-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
+#renderMenu .rai-status-card{padding:16px;border-radius:22px;background:linear-gradient(180deg, rgba(16,24,38,.96), rgba(10,15,25,.98));border:1px solid rgba(124,145,176,.14);box-shadow:0 14px 28px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.04)}
 #renderMenu .rai-status-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
-#renderMenu .rai-status-title{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#dbefff;font-weight:900}
-#renderMenu .rai-status-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid rgba(129,193,255,.18);background:linear-gradient(180deg, rgba(22,36,58,.96), rgba(12,20,32,.98));color:#eff8ff;font-size:11px;font-weight:900;letter-spacing:.12em;text-transform:uppercase}
-#renderMenu .rai-status-dot{width:8px;height:8px;border-radius:999px;background:#7ee4ff;box-shadow:0 0 16px rgba(126,228,255,.55)}
-#renderMenu .rai-status-pill.is-busy .rai-status-dot{background:#ffd36f;box-shadow:0 0 18px rgba(255,211,111,.7);animation:raiPulse 1.2s ease-in-out infinite}
-#renderMenu .rai-status-copy{font-size:12px;line-height:1.6;color:rgba(232,243,252,.82)}
+#renderMenu .rai-status-title{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#dbe4f0;font-weight:900}
+#renderMenu .rai-status-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid rgba(124,145,176,.16);background:rgba(18,26,39,.94);color:#eff5fc;font-size:11px;font-weight:900;letter-spacing:.12em;text-transform:uppercase}
+#renderMenu .rai-status-dot{width:8px;height:8px;border-radius:999px;background:#7fb598;box-shadow:0 0 0 4px rgba(127,181,152,.12)}
+#renderMenu .rai-status-pill.is-busy .rai-status-dot{background:#d9b068;box-shadow:0 0 0 4px rgba(217,176,104,.14);animation:raiPulse 1.5s ease-in-out infinite}
+#renderMenu .rai-status-copy{font-size:12px;line-height:1.7;color:rgba(226,233,242,.76)}
 #renderMenu .rai-status-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-#renderMenu .rai-status-metric{padding:12px;border-radius:16px;border:1px solid rgba(127,193,255,.14);background:linear-gradient(180deg, rgba(15,24,39,.94), rgba(10,16,26,.98))}
-#renderMenu .rai-status-metric b{display:block;font-size:18px;line-height:1;color:#f5fbff;font-weight:900;margin-bottom:6px}
-#renderMenu .rai-status-metric span{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:rgba(226,237,248,.66);font-weight:900}
-#renderMenu .rai-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
+#renderMenu .rai-status-metric{padding:12px;border-radius:16px;border:1px solid rgba(124,145,176,.12);background:rgba(14,21,32,.94)}
+#renderMenu .rai-status-metric b{display:block;font-size:18px;line-height:1;color:#f2f6fb;font-weight:900;margin-bottom:6px}
+#renderMenu .rai-status-metric span{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:rgba(220,227,236,.6);font-weight:900}
+#renderMenu .rai-grid{display:grid;grid-template-columns:1.08fr .92fr;gap:16px}
 #renderMenu .rai-panel{padding:16px}
-#renderMenu .rai-panel h3,#renderMenu .rai-feed-head h3,#renderMenu .rai-compose-head h3{margin:0;font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:#dbefff}
+#renderMenu .rai-panel h3,#renderMenu .rai-feed-head h3,#renderMenu .rai-compose-head h3{margin:0;font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#dbe4f0;font-weight:900}
 #renderMenu .rai-quick-grid,#renderMenu .rai-toggle-grid,#renderMenu .rai-feed{display:grid;gap:10px}
 #renderMenu .rai-quick-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 #renderMenu button.rai-quick,#renderMenu button.rai-toggle,#renderMenu button.rai-button{appearance:none;-webkit-appearance:none;font:inherit;text-align:left;text-transform:none;letter-spacing:normal}
-#renderMenu .rai-quick{display:grid;align-content:start;gap:10px;min-height:154px;width:100%;padding:14px;border-radius:16px;border:1px solid rgba(125,188,255,.14);background:linear-gradient(180deg, rgba(18,31,49,.92), rgba(11,18,29,.97));cursor:pointer;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;box-sizing:border-box}
-#renderMenu .rai-quick:hover{transform:translateY(-2px);border-color:rgba(133,208,255,.32);box-shadow:0 12px 24px rgba(0,0,0,.18)}
-#renderMenu .rai-quick strong{display:block;font-size:13px;line-height:1.25;color:#f5fbff;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
-#renderMenu .rai-quick span,#renderMenu .rai-toggle-copy span,#renderMenu .rai-feed-head span,#renderMenu .rai-compose-head span,#renderMenu .rai-empty,#renderMenu .rai-msg-meta,#renderMenu .rai-summary div,#renderMenu .rai-next div,#renderMenu .rai-attachment-copy span{font-size:11px;line-height:1.5;color:rgba(225,238,248,.7)}
-#renderMenu .rai-toggle{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;width:100%;min-height:94px;padding:14px 16px;border-radius:18px;border:1px solid rgba(123,185,255,.14);background:linear-gradient(180deg, rgba(14,24,38,.96), rgba(10,17,29,.98));cursor:pointer;box-sizing:border-box;transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease}
-#renderMenu .rai-toggle:hover{transform:translateY(-1px);border-color:rgba(144,214,255,.28);box-shadow:0 12px 26px rgba(0,0,0,.16)}
+#renderMenu .rai-quick{display:grid;align-content:start;gap:10px;min-height:144px;width:100%;padding:14px;border-radius:16px;border:1px solid rgba(124,145,176,.12);background:linear-gradient(180deg, rgba(18,28,43,.96), rgba(12,18,28,.98));cursor:pointer;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease,background .16s ease;box-sizing:border-box}
+#renderMenu .rai-quick:hover{transform:translateY(-1px);border-color:rgba(182,159,118,.28);box-shadow:0 10px 20px rgba(0,0,0,.14);background:linear-gradient(180deg, rgba(21,31,46,.98), rgba(13,20,31,.98))}
+#renderMenu .rai-quick strong{display:block;font-size:13px;line-height:1.28;color:#f4f7fb;font-weight:900;letter-spacing:.06em;text-transform:uppercase}
+#renderMenu .rai-quick span,#renderMenu .rai-toggle-copy span,#renderMenu .rai-feed-head span,#renderMenu .rai-compose-head span,#renderMenu .rai-empty,#renderMenu .rai-msg-meta,#renderMenu .rai-summary div,#renderMenu .rai-next div,#renderMenu .rai-attachment-copy span,#renderMenu .rai-msg-stage{font-size:11px;line-height:1.55;color:rgba(219,227,236,.66)}
+#renderMenu .rai-toggle-grid{grid-template-columns:1fr}
+#renderMenu .rai-toggle{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;width:100%;min-height:96px;padding:14px 16px;border-radius:18px;border:1px solid rgba(124,145,176,.12);background:linear-gradient(180deg, rgba(14,22,34,.98), rgba(10,16,26,.98));cursor:pointer;box-sizing:border-box;transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease}
+#renderMenu .rai-toggle:hover{transform:translateY(-1px);border-color:rgba(182,159,118,.22);box-shadow:0 10px 22px rgba(0,0,0,.14)}
 #renderMenu .rai-toggle-copy{display:grid;gap:5px;min-width:0}
-#renderMenu .rai-toggle-copy strong,#renderMenu .rai-msg-role,#renderMenu .rai-attachment-copy strong{font-size:13px;line-height:1.2;color:#f5fbff;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+#renderMenu .rai-toggle-copy strong,#renderMenu .rai-msg-role,#renderMenu .rai-attachment-copy strong{font-size:12px;line-height:1.2;color:#f3f7fb;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
 #renderMenu .rai-toggle-meta{display:grid;justify-items:end;gap:8px}
-#renderMenu .rai-toggle-state{display:inline-flex;align-items:center;justify-content:center;min-width:50px;height:24px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);color:rgba(234,245,255,.74);font-size:10px;font-weight:900;letter-spacing:.14em;text-transform:uppercase}
-#renderMenu .rai-switch{position:relative;width:48px;height:28px;border-radius:999px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.1);transition:background .18s ease,border-color .18s ease}
-#renderMenu .rai-switch::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:999px;background:#eef8ff;transition:transform .18s ease;box-shadow:0 6px 12px rgba(0,0,0,.2)}
-#renderMenu .rai-toggle.active .rai-switch{background:linear-gradient(90deg, rgba(60,164,255,.92), rgba(109,223,255,.96));border-color:rgba(145,224,255,.5)}
-#renderMenu .rai-toggle.active .rai-switch::after{transform:translateX(20px)}
-#renderMenu .rai-toggle.active .rai-toggle-state{background:rgba(92,196,255,.16);border-color:rgba(121,215,255,.28);color:#9ce5ff}
-#renderMenu .rai-feed-card{padding:16px;min-height:360px;display:grid;grid-template-rows:auto 1fr}
-#renderMenu .rai-feed-head,#renderMenu .rai-compose-head,#renderMenu .rai-msg-head{display:flex;justify-content:space-between;align-items:center;gap:10px}
-#renderMenu .rai-feed{min-height:220px;max-height:540px;overflow:auto;padding-right:2px}
-#renderMenu .rai-empty{display:grid;place-items:center;text-align:center;padding:24px;border-radius:18px;border:1px dashed rgba(137,197,255,.18);background:rgba(255,255,255,.025)}
-#renderMenu .rai-msg{padding:13px 14px;border-radius:18px;border:1px solid rgba(128,190,255,.12);background:linear-gradient(180deg, rgba(16,26,42,.94), rgba(10,16,28,.98))}
-#renderMenu .rai-msg-user{border-color:rgba(110,206,255,.25);background:linear-gradient(180deg, rgba(16,38,57,.94), rgba(8,20,34,.98))}
-#renderMenu .rai-msg-tool{border-color:rgba(255,204,102,.24);background:linear-gradient(180deg, rgba(51,35,13,.92), rgba(26,19,10,.98))}
-#renderMenu .rai-msg-pending{border-color:rgba(255,214,121,.28);background:linear-gradient(180deg, rgba(38,33,19,.94), rgba(18,15,10,.98))}
+#renderMenu .rai-toggle-state{display:inline-flex;align-items:center;justify-content:center;min-width:54px;height:24px;padding:0 10px;border-radius:999px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.04);color:rgba(229,236,244,.74);font-size:10px;font-weight:900;letter-spacing:.14em;text-transform:uppercase}
+#renderMenu .rai-switch{position:relative;width:50px;height:29px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.08);transition:background .18s ease,border-color .18s ease}
+#renderMenu .rai-switch::after{content:"";position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:999px;background:#f2f6fb;transition:transform .18s ease;box-shadow:0 4px 10px rgba(0,0,0,.22)}
+#renderMenu .rai-toggle.active .rai-switch{background:linear-gradient(90deg, rgba(104,147,208,.95), rgba(214,182,118,.88));border-color:rgba(214,182,118,.34)}
+#renderMenu .rai-toggle.active .rai-switch::after{transform:translateX(21px)}
+#renderMenu .rai-toggle.active .rai-toggle-state{background:rgba(214,182,118,.1);border-color:rgba(214,182,118,.18);color:#edd39c}
+#renderMenu .rai-feed-card{padding:16px;min-height:420px;display:grid;grid-template-rows:auto 1fr}
+#renderMenu .rai-feed-head,#renderMenu .rai-compose-head,#renderMenu .rai-msg-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+#renderMenu .rai-feed{min-height:280px;max-height:680px;overflow:auto;padding-right:2px}
+#renderMenu .rai-empty{display:grid;place-items:center;text-align:center;padding:28px;border-radius:18px;border:1px dashed rgba(124,145,176,.18);background:rgba(255,255,255,.02)}
+#renderMenu .rai-msg{padding:15px 16px;border-radius:18px;border:1px solid rgba(124,145,176,.1);background:linear-gradient(180deg, rgba(17,25,38,.98), rgba(12,18,28,.99));box-shadow:inset 3px 0 0 rgba(124,145,176,.16)}
+#renderMenu .rai-msg-user{border-color:rgba(100,144,206,.16);background:linear-gradient(180deg, rgba(16,30,49,.98), rgba(9,18,31,.98));box-shadow:inset 3px 0 0 rgba(108,152,212,.55)}
+#renderMenu .rai-msg-tool{border-color:rgba(212,176,104,.16);background:linear-gradient(180deg, rgba(40,30,17,.98), rgba(20,16,10,.99));box-shadow:inset 3px 0 0 rgba(212,176,104,.62)}
+#renderMenu .rai-msg-pending{border-color:rgba(212,176,104,.18);background:linear-gradient(180deg, rgba(34,28,18,.98), rgba(18,14,10,.99));box-shadow:inset 3px 0 0 rgba(212,176,104,.58)}
 #renderMenu .rai-msg-head{margin-bottom:8px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
-#renderMenu .rai-msg-text{font-size:12px;line-height:1.66;color:#eaf5ff}
-#renderMenu .rai-thinking{display:flex;align-items:center;gap:8px;margin:4px 0 10px}
-#renderMenu .rai-thinking span{width:10px;height:10px;border-radius:999px;background:linear-gradient(180deg, #ffd97f, #ffbb4d);box-shadow:0 0 14px rgba(255,197,92,.42);animation:raiThinking 1.15s ease-in-out infinite}
+#renderMenu .rai-msg-role{display:inline-flex;align-items:center;gap:8px}
+#renderMenu .rai-msg-icon{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);font-size:10px;color:#ebf1f8}
+#renderMenu .rai-msg-text{font-size:12px;line-height:1.74;color:#edf2f8;white-space:normal;overflow-wrap:anywhere}
+#renderMenu .rai-msg-stage{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.06)}
+#renderMenu .rai-thinking{display:flex;align-items:center;gap:7px;margin:4px 0 10px}
+#renderMenu .rai-thinking span{width:9px;height:9px;border-radius:999px;background:linear-gradient(180deg, #e3c98c, #c89b49);animation:raiThinking 1.15s ease-in-out infinite}
 #renderMenu .rai-thinking span:nth-child(2){animation-delay:.12s}
 #renderMenu .rai-thinking span:nth-child(3){animation-delay:.24s}
-#renderMenu .rai-summary,#renderMenu .rai-next{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}
+#renderMenu .rai-summary,#renderMenu .rai-next{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.06)}
 #renderMenu .rai-summary div,#renderMenu .rai-next div{padding-left:14px;position:relative}
-#renderMenu .rai-summary div::before,#renderMenu .rai-next div::before{content:"";position:absolute;left:0;top:.55em;width:6px;height:6px;border-radius:999px;background:#86dbff;box-shadow:0 0 12px rgba(134,219,255,.45)}
+#renderMenu .rai-summary div::before,#renderMenu .rai-next div::before{content:"";position:absolute;left:0;top:.58em;width:6px;height:6px;border-radius:999px;background:#d2b173}
 #renderMenu .rai-composer{padding:16px;display:grid;gap:12px}
-#renderMenu .rai-composer textarea{position:relative;z-index:2;width:100%;min-height:130px;resize:vertical;border-radius:18px;border:1px solid rgba(130,192,255,.14);background:rgba(8,14,24,.92);color:#f5fbff;padding:16px 17px;box-sizing:border-box;font:500 14px/1.55 'Segoe UI',system-ui,Arial,sans-serif;outline:none;transition:border-color .18s ease, box-shadow .18s ease;pointer-events:auto;user-select:text}
-#renderMenu .rai-composer textarea:focus{border-color:rgba(124,211,255,.38);box-shadow:0 0 0 3px rgba(98,197,255,.12)}
-#renderMenu .rai-composer textarea::placeholder{color:rgba(215,231,244,.42)}
-#renderMenu .rai-attachment{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;border:1px solid rgba(127,193,255,.16);background:linear-gradient(180deg, rgba(15,24,39,.94), rgba(10,16,26,.98))}
-#renderMenu .rai-attachment img{width:72px;height:72px;object-fit:cover;border-radius:12px;border:1px solid rgba(127,193,255,.18)}
-#renderMenu .rai-button{display:inline-flex;align-items:center;gap:8px;justify-content:center;min-height:42px;padding:0 16px;border:none;border-radius:14px;background:linear-gradient(135deg, rgba(62,169,255,.95), rgba(118,225,255,.92));color:#04121e;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;cursor:pointer;transition:transform .16s ease, box-shadow .16s ease, filter .16s ease}
-#renderMenu .rai-button:hover{transform:translateY(-2px);box-shadow:0 14px 26px rgba(70,168,255,.24)}
-#renderMenu .rai-button:disabled{filter:grayscale(.18) brightness(.86);cursor:wait;transform:none}
-#renderMenu .rai-button-secondary{background:linear-gradient(180deg, rgba(24,39,63,.96), rgba(12,20,33,.98));color:#eff8ff;border:1px solid rgba(129,193,255,.16)}
+#renderMenu .rai-composer textarea{position:relative;z-index:2;width:100%;min-height:142px;resize:vertical;border-radius:18px;border:1px solid rgba(124,145,176,.14);background:rgba(8,13,22,.96);color:#f5f7fb;padding:16px 17px;box-sizing:border-box;font:500 14px/1.6 'Segoe UI',system-ui,Arial,sans-serif;outline:none;transition:border-color .18s ease, box-shadow .18s ease, background .18s ease;pointer-events:auto;user-select:text}
+#renderMenu .rai-composer textarea:focus{border-color:rgba(182,159,118,.34);box-shadow:0 0 0 3px rgba(182,159,118,.08);background:rgba(10,16,26,.98)}
+#renderMenu .rai-composer textarea::placeholder{color:rgba(210,220,232,.38)}
+#renderMenu .rai-attachment{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;border:1px solid rgba(124,145,176,.14);background:rgba(14,21,32,.94)}
+#renderMenu .rai-attachment img{width:72px;height:72px;object-fit:cover;border-radius:12px;border:1px solid rgba(124,145,176,.16)}
+#renderMenu .rai-button{display:inline-flex;align-items:center;gap:8px;justify-content:center;min-height:42px;padding:0 16px;border:none;border-radius:14px;background:linear-gradient(180deg, rgba(83,139,212,.96), rgba(72,119,190,.96));color:#f7fbff;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.1em;cursor:pointer;transition:transform .16s ease, box-shadow .16s ease, filter .16s ease}
+#renderMenu .rai-button:hover{transform:translateY(-1px);box-shadow:0 12px 22px rgba(54,92,145,.18)}
+#renderMenu .rai-button:disabled{filter:grayscale(.12) brightness(.86);cursor:wait;transform:none}
+#renderMenu .rai-button-secondary{background:rgba(19,27,41,.96);color:#edf3fb;border:1px solid rgba(124,145,176,.16)}
 #renderMenu .rai-actions input[type="file"]{display:none}
+#renderMenu .rai-context-chip{position:relative;display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:12px;background:rgba(18,27,41,.94);border:1px solid rgba(124,145,176,.14);cursor:default;color:#e6edf7;font-size:11px;font-weight:800}
+#renderMenu .rai-context-bar{position:relative;width:46px;height:7px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
+#renderMenu .rai-context-bar span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg, rgba(102,147,209,.96), rgba(215,183,118,.96))}
+#renderMenu .rai-context-copy{white-space:nowrap}
+#renderMenu .rai-context-pop{position:absolute;right:0;top:calc(100% + 10px);width:220px;padding:12px 13px;border-radius:14px;background:rgba(56,62,52,.96);border:1px solid rgba(255,255,255,.06);box-shadow:0 18px 32px rgba(0,0,0,.24);color:#f3f3ee;font-size:11px;line-height:1.55;opacity:0;transform:translateY(4px);pointer-events:none;transition:opacity .16s ease,transform .16s ease;z-index:12}
+#renderMenu .rai-context-pop strong{display:block;margin-bottom:6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#fff}
+#renderMenu .rai-context-chip:hover .rai-context-pop,#renderMenu .rai-context-chip:focus-within .rai-context-pop{opacity:1;transform:translateY(0)}
 @keyframes raiOrbit{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-@keyframes raiPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.12);opacity:.72}}
+@keyframes raiPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.08);opacity:.7}}
 @keyframes raiScan{0%,100%{transform:translateY(0)}50%{transform:translateY(-34px)}}
 @keyframes raiBlink{0%,44%,100%{transform:scaleY(1)}46%,48%{transform:scaleY(.18)}}
-@keyframes raiThinking{0%,100%{transform:translateY(0) scale(1);opacity:.55}50%{transform:translateY(-4px) scale(1.12);opacity:1}}
+@keyframes raiThinking{0%,100%{transform:translateY(0) scale(1);opacity:.58}50%{transform:translateY(-4px) scale(1.08);opacity:1}}
 @media (max-width:1220px){#renderMenu .rai-hero,#renderMenu .rai-grid{grid-template-columns:1fr}}
 @media (max-width:980px){#renderMenu .rai-status-grid{grid-template-columns:1fr}#renderMenu .rai-status-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:820px){#renderMenu .rai-shell{padding:12px;border-radius:18px}#renderMenu .rai-title{font-size:24px}#renderMenu .rai-quick-grid{grid-template-columns:1fr}#renderMenu .rai-status-metrics{grid-template-columns:1fr}}
+@media (max-width:820px){#renderMenu .rai-shell{padding:12px;border-radius:18px}#renderMenu .rai-title{font-size:24px}#renderMenu .rai-quick-grid{grid-template-columns:1fr}#renderMenu .rai-status-metrics{grid-template-columns:1fr}#renderMenu .rai-copy-top,#renderMenu .rai-feed-head,#renderMenu .rai-compose-head{flex-direction:column;align-items:flex-start}}
 `;
     document.head.appendChild(style);
   };
@@ -2091,11 +2170,20 @@
     return `
       <div class="rai-shell">
         <section class="rai-hero">
-          <div class="rai-robot-card"><div class="rai-robot"><div class="rai-robot-orbit"></div><div class="rai-robot-head"><div class="rai-robot-face"><div class="rai-eyes"><span class="rai-eye"></span><span class="rai-eye"></span></div><div class="rai-mouth"></div></div></div></div></div>
+          <div class="rai-robot-card">
+            <div class="rai-robot"><div class="rai-robot-orbit"></div><div class="rai-robot-head"><div class="rai-robot-face"><div class="rai-eyes"><span class="rai-eye"></span><span class="rai-eye"></span></div><div class="rai-mouth"></div></div></div></div>
+            <div class="rai-robot-foot"><strong>Tactical Assistant</strong><span>Live runtime guidance, controlled automation, and guarded combat tuning.</span></div>
+          </div>
           <div class="rai-panel rai-copy">
-            <span class="rai-kicker">Render AI Assistant</span>
-            <div class="rai-title">Full mope.io runtime access <span>with debug + automation tools.</span></div>
-            <p>Live console logs, network traces, storage and application state, packet analyzer context, dump-target research, source-safe runtime inspection, live PvP/ESP/visual tuning, game controls, and optional screenshot analysis are wired into one assistant loop.</p>
+            <div class="rai-copy-top">
+              <div class="rai-copy-side">
+                <span class="rai-kicker"><span class="rai-kicker-dot"></span>Assistant Surface</span>
+                <span class="rai-model-chip">${esc(state.lastModel || "GLM bridge")}</span>
+              </div>
+              <div class="rai-head-actions">${renderContextMeter()}</div>
+            </div>
+            <div class="rai-title">Combat-ready runtime control <span>with cleaner chat, sharper tools, and full live visibility.</span></div>
+            <p>Inspect page state, tune PvP or visuals, trace failures, and drive controlled actions without the neon AI demo look. The panel stays practical, readable, and aligned with the rest of the menu.</p>
             <div class="rai-pill-row">
               <div class="rai-pill">session <b>${esc(hasSession() ? "active" : "missing")}</b></div>
               <div class="rai-pill">admin <b>${esc(isAdmin() ? "yes" : "no")}</b></div>
@@ -2146,11 +2234,28 @@
           </div>
         </section>
         <section class="rai-feed-card">
-          <div class="rai-feed-head"><h3>Assistant Feed</h3><span>${esc(statusText)}</span></div>
+          <div class="rai-feed-head">
+            <div>
+              <h3>Assistant Feed</h3>
+              <span>Full conversation, tool results, and current thinking state.</span>
+            </div>
+            <div class="rai-feed-side">
+              ${renderContextMeter()}
+              <span>${esc(statusText)}</span>
+            </div>
+          </div>
           <div class="rai-feed" id="renderAiFeed">${renderFeedMarkup()}</div>
         </section>
         <section class="rai-composer">
-          <div class="rai-compose-head"><h3>Prompt + Tools</h3><span>${esc(state.attachment ? "image attached" : "text only")}</span></div>
+          <div class="rai-compose-head">
+            <div>
+              <h3>Prompt + Tools</h3>
+              <span>${esc(state.attachment ? "image attached" : "text only")}</span>
+            </div>
+            <div class="rai-compose-side">
+              <span>${esc(state.pending ? pendingDetail : "Shift+Enter for a new line.")}</span>
+            </div>
+          </div>
           ${renderAttachmentMarkup()}
           <textarea id="renderAiComposer" placeholder="Ask it to debug the page, inspect a selector, analyze recent errors, automate a click flow, or explain mope.io state." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">${esc(state.composerDraft || "")}</textarea>
           <div class="rai-toolbar">
